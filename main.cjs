@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -49,6 +49,162 @@ function fetchJson(requestUrl, options = {}) {
 
 const aiServerUrl = process.env.AI_SERVER_URL || 'http://127.0.0.1:8080/v1/chat/completions';
 const aiModel = process.env.AI_MODEL || 'gemma-3-4b';
+
+// ---------------------------------------------------------------------------
+// REPORT SYSTEM
+// Every executed task generates a text report under C:\AI\Reports. The folder
+// structure below scales Compilator beyond just reports:
+//   C:\AI\Reports   — task reports (YYYY-MM-DD_HH-mm-ss_<task-name>.txt)
+//   C:\AI\Logs      — reserved for future logs
+//   C:\AI\Config    — reserved for future configuration
+//   C:\AI\Workspace — reserved for future workspace artifacts
+// ---------------------------------------------------------------------------
+const AI_ROOT = 'C:/AI';
+const REPORT_DIR = path.join(AI_ROOT, 'Reports');
+
+function ensureAIDirs() {
+  for (const dir of ['Reports', 'Logs', 'Config', 'Workspace']) {
+    fs.mkdirSync(path.join(AI_ROOT, dir), { recursive: true });
+  }
+}
+
+function sanitizeTaskName(name) {
+  const clean = String(name || 'task')
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return clean || 'task';
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+const fmtDateTime = (d) =>
+  `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+const fmtFileStamp = (d) =>
+  `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`;
+
+const REPORT_STATUS = {
+  done: 'Completed',
+  already_installed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+};
+
+function buildReport(run) {
+  const statusLabel = REPORT_STATUS[run.status] || String(run.status || 'Done');
+  const durationSec = Math.max(0, Math.round((run.finishedAt - run.startedAt) / 1000));
+  const stdoutText = run.stdout.length ? run.stdout.join('') : '(no output)';
+  const stderrText = run.stderr.length ? run.stderr.join('') : '(no stderr)';
+  const lines = [];
+  lines.push('=====================================');
+  lines.push('COMPILATOR TASK REPORT');
+  lines.push('=====================================');
+  lines.push('');
+  lines.push('Task:');
+  lines.push(run.task.label);
+  lines.push('');
+  lines.push('Type:');
+  lines.push(run.task.type);
+  lines.push('');
+  lines.push('Started:');
+  lines.push(run.startedAt ? fmtDateTime(run.startedAt) : '(unknown)');
+  lines.push('');
+  lines.push('Finished:');
+  lines.push(run.finishedAt ? fmtDateTime(run.finishedAt) : '(unknown)');
+  lines.push('');
+  lines.push('Duration:');
+  lines.push(`${durationSec} seconds`);
+  lines.push('');
+  lines.push('Status:');
+  lines.push(statusLabel);
+  lines.push('');
+  lines.push('Command:');
+  lines.push(run.task.command || '(none)');
+  lines.push('');
+  lines.push('Exit Code:');
+  lines.push(run.exitCode === undefined || run.exitCode === null ? '(none)' : String(run.exitCode));
+  lines.push('');
+  lines.push('-------------------------------------');
+  lines.push('OUTPUT');
+  lines.push('-------------------------------------');
+  lines.push('');
+  lines.push(stdoutText);
+  lines.push('');
+  lines.push('-------------------------------------');
+  lines.push('ERRORS');
+  lines.push('-------------------------------------');
+  lines.push('');
+  lines.push(stderrText);
+  if (run.error) {
+    lines.push('');
+    lines.push('Error Message:');
+    lines.push(run.error.message || String(run.error));
+    if (run.error.stack) {
+      lines.push('');
+      lines.push('Stack Trace:');
+      lines.push(run.error.stack);
+    }
+  }
+  lines.push('');
+  lines.push('=====================================');
+  lines.push('END REPORT');
+  lines.push('=====================================');
+  return lines.join('\n');
+}
+
+async function writeTaskReport(run) {
+  try {
+    ensureAIDirs();
+    const fileName = `${fmtFileStamp(run.startedAt || new Date())}_${sanitizeTaskName(run.task.label)}.txt`;
+    const reportPath = path.join(REPORT_DIR, fileName);
+    await fs.promises.writeFile(reportPath, buildReport(run), 'utf8');
+    return reportPath;
+  } catch (err) {
+    console.error('Failed to write task report:', err);
+    return null;
+  }
+}
+
+// In-memory record of currently running tasks so reports can capture full
+// stdout/stderr, timing and failure details without changing the task format.
+const activeTaskRuns = new Map();
+
+function startTaskRun(task, wc, command) {
+  const run = {
+    id: task.id,
+    task: { ...task, command },
+    wc,
+    startedAt: new Date(),
+    stdout: [],
+    stderr: [],
+    error: null,
+    status: 'running',
+    exitCode: null,
+    finishedAt: null,
+    finished: false,
+  };
+  activeTaskRuns.set(task.id, run);
+  wc.send('task:update', { id: task.id, status: 'running', command });
+  return run;
+}
+
+async function finishTaskRun(id, { status, exitCode, error }) {
+  const run = activeTaskRuns.get(id);
+  if (!run || run.finished) return;
+  run.finished = true;
+  run.status = status;
+  run.exitCode = exitCode;
+  run.error = error || run.error || null;
+  run.finishedAt = new Date();
+  const reportPath = await writeTaskReport(run);
+  try {
+    if (run.wc && !run.wc.isDestroyed() && reportPath) {
+      run.wc.send('task:reportCreated', { id, reportPath });
+    }
+  } catch (err) {
+    console.error('Failed to emit task:reportCreated:', err);
+  }
+  activeTaskRuns.delete(id);
+}
 
 // ---------------------------------------------------------------------------
 // TASK PLANNER
@@ -301,21 +457,27 @@ async function getInstalledPackages() {
 // EXECUTION ENGINE — spawn-based; emits task:update / task:log live events.
 // ---------------------------------------------------------------------------
 function streamWinget(task, wc, args, command, logPrefix) {
-  wc.send('task:update', { id: task.id, status: 'running', command });
+  const run = startTaskRun(task, wc, command);
   const proc = spawn('winget', args);
   proc.stdout.on('data', (data) => {
+    run.stdout.push(data.toString());
     wc.send('task:log', { id: task.id, line: data.toString() });
   });
   proc.stderr.on('data', (data) => {
+    run.stderr.push(data.toString());
     wc.send('task:log', { id: task.id, line: data.toString() });
   });
   proc.on('error', (err) => {
+    run.error = err;
     wc.send('task:log', { id: task.id, line: `\n[error] ${err.message}\n` });
     wc.send('task:update', { id: task.id, status: 'failed' });
+    finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
   });
   proc.on('close', (code) => {
     wc.send('task:log', { id: task.id, line: logPrefix ? `${logPrefix} exit code ${code}\n` : '' });
-    wc.send('task:update', { id: task.id, status: code === 0 ? 'done' : 'failed', exitCode: code });
+    const status = code === 0 ? 'done' : 'failed';
+    wc.send('task:update', { id: task.id, status, exitCode: code });
+    finishTaskRun(task.id, { status, exitCode: code, error: status === 'failed' ? new Error(`Process exited with code ${code}`) : null });
   });
 }
 
@@ -328,27 +490,37 @@ const TASK_RUNNERS = {
     streamWinget(task, wc, ['list', '--accept-source-agreements'], 'winget list --accept-source-agreements', '[winget]');
   },
   'mkdir': async (task, wc) => {
-    wc.send('task:update', { id: task.id, status: 'running', command: `mkdir ${task.params.path}` });
+    const command = `mkdir ${task.params.path}`;
+    const run = startTaskRun(task, wc, command);
     try {
       await fs.promises.mkdir(task.params.path, { recursive: true });
+      run.stdout.push(`Created folder: ${task.params.path}\n`);
       wc.send('task:log', { id: task.id, line: `Created folder: ${task.params.path}\n` });
       wc.send('task:update', { id: task.id, status: 'done' });
+      finishTaskRun(task.id, { status: 'done', exitCode: 0, error: null });
     } catch (err) {
+      run.error = err;
       wc.send('task:log', { id: task.id, line: `[error] ${err.message}\n` });
       wc.send('task:update', { id: task.id, status: 'failed' });
+      finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
     }
   },
   'write_file': async (task, wc) => {
-    wc.send('task:update', { id: task.id, status: 'running', command: `write_file ${task.params.path}` });
+    const command = `write_file ${task.params.path}`;
+    const run = startTaskRun(task, wc, command);
     try {
       const dir = path.dirname(task.params.path);
       await fs.promises.mkdir(dir, { recursive: true });
       await fs.promises.writeFile(task.params.path, task.params.content ?? '', 'utf8');
+      run.stdout.push(`Wrote ${task.params.content?.length ?? 0} bytes to ${task.params.path}\n`);
       wc.send('task:log', { id: task.id, line: `Wrote ${task.params.content?.length ?? 0} bytes to ${task.params.path}\n` });
       wc.send('task:update', { id: task.id, status: 'done' });
+      finishTaskRun(task.id, { status: 'done', exitCode: 0, error: null });
     } catch (err) {
+      run.error = err;
       wc.send('task:log', { id: task.id, line: `[error] ${err.message}\n` });
       wc.send('task:update', { id: task.id, status: 'failed' });
+      finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
     }
   },
 };
@@ -388,6 +560,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  ensureAIDirs();
   createWindow();
 
   app.on('activate', function () {
@@ -416,6 +589,29 @@ ipcMain.handle('execute-task', async (event, payload) => {
 
   runner({ id: taskId, params: params || {} }, mainWindow.webContents);
   return { success: true, taskId };
+});
+
+// ---------------------------------------------------------------------------
+// IPC: open a generated report file with the OS default application.
+// ---------------------------------------------------------------------------
+ipcMain.handle('open-report', async (event, reportPath) => {
+  if (typeof reportPath !== 'string' || !reportPath) {
+    return { success: false, error: 'Invalid report path' };
+  }
+  const failure = await shell.openPath(reportPath);
+  return failure ? { success: false, error: failure } : { success: true };
+});
+
+// ---------------------------------------------------------------------------
+// IPC: reveal the folder containing a generated report in the OS file manager.
+// ---------------------------------------------------------------------------
+ipcMain.handle('open-report-folder', async (event, reportPath) => {
+  if (typeof reportPath !== 'string' || !reportPath) {
+    return { success: false, error: 'Invalid report path' };
+  }
+  const folder = path.dirname(reportPath);
+  const failure = await shell.openPath(folder);
+  return failure ? { success: false, error: failure } : { success: true };
 });
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import './App.css';
+import FloatingTerminal, { type TerminalBounds } from './components/FloatingTerminal';
 
 declare global {
   interface Window {
@@ -7,8 +8,11 @@ declare global {
       executeTask: (p: { taskId: string; type: string; params: Record<string, string> }) => Promise<{ success: boolean; taskId: string; error?: string }>;
       chatWithAI: (prompt: string) => Promise<{ success: boolean; reply?: string; error?: string; tasks?: PlannerTask[]; tasks_skipped?: SkippedRequest[] }>;
       wingetList: () => Promise<{ success: boolean; output?: string; error?: string }>;
+      openReport: (reportPath: string) => Promise<{ success: boolean; error?: string }>;
+      openReportFolder: (reportPath: string) => Promise<{ success: boolean; error?: string }>;
       onTaskUpdate: (cb: (d: { id: string; status: string; command?: string }) => void) => () => void;
       onTaskLog: (cb: (d: { id: string; line: string }) => void) => () => void;
+      onReportCreated: (cb: (d: { id: string; reportPath: string }) => void) => () => void;
     };
   }
 }
@@ -41,6 +45,19 @@ const CATALOG: Record<string, { name: string; id: string }> = {
 };
 
 const clean = (s: string) => s.replace(/["']/g, '').replace(/\b(?:named|called)\s+/i, '').trim();
+
+const DEFAULT_TERMINAL_BOUNDS = { width: 600, height: 420 };
+
+interface TerminalWindowState {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  minimized: boolean;
+  closed: boolean;
+  zIndex: number;
+}
 
 function browserPlanner(request: string): { tasks: PlannerTask[]; tasks_skipped: SkippedRequest[] } {
   const text = (request || '').toLowerCase().trim();
@@ -89,13 +106,97 @@ function App() {
   ]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [reports, setReports] = useState<Record<string, string>>({});
   const boxRef = useRef<HTMLDivElement>(null);
+
+  // ---- Floating terminal window management --------------------------------
+  // Every task that has ever opened a terminal window keeps its state here
+  // for the whole application session. Closing a window only toggles
+  // `closed` — the window object (with logs, bounds, z-index) is preserved so
+  // reopening restores everything and no duplicate windows are ever created.
+  const [terminalWindows, setTerminalWindows] = useState<Record<string, TerminalWindowState>>({});
+  // Monotonic z-index counter so newly focused windows always render on top.
+  const [zCounter, setZCounter] = useState(1000);
+
+  const openTerminal = useCallback((id: string) => {
+    setTerminalWindows(prev => {
+      const existing = prev[id];
+      if (existing) {
+        // Reopening an existing window: restore it (no duplicate) and bring
+        // it to the front with a fresh z-index.
+        return {
+          ...prev,
+          [id]: {
+            ...existing,
+            closed: false,
+            zIndex: zCounter + 1,
+          },
+        };
+      }
+      const count = Object.keys(prev).length;
+      return {
+        ...prev,
+        [id]: {
+          id,
+          ...DEFAULT_TERMINAL_BOUNDS,
+          x: 80 + (count % 6) * 40,
+          y: 80 + (count % 6) * 36,
+          minimized: false,
+          closed: false,
+          zIndex: zCounter + 1,
+        },
+      };
+    });
+    setZCounter(z => z + 1);
+  }, [zCounter]);
+
+  // Close only hides the window. Logs keep streaming and the task keeps
+  // running; reopening restores the accumulated logs, bounds and z-index.
+  const closeTerminal = (id: string) => {
+    setTerminalWindows(prev => {
+      const win = prev[id];
+      if (!win) return prev;
+      return { ...prev, [id]: { ...win, closed: true } };
+    });
+  };
+
+  const focusTerminal = (id: string) => {
+    setTerminalWindows(prev => {
+      const win = prev[id];
+      if (!win || win.closed) return prev;
+      // Keep every other window's z-index; raise only this one above all.
+      const maxZ = Math.max(1000, ...Object.values(prev).map(w => w.zIndex));
+      if (win.zIndex === maxZ) return prev;
+      const nextZ = maxZ + 1;
+      return { ...prev, [id]: { ...win, zIndex: nextZ } };
+    });
+  };
+
+  const toggleMinimizeTerminal = (id: string) => {
+    setTerminalWindows(prev => {
+      const win = prev[id];
+      if (!win || win.closed) return prev;
+      return { ...prev, [id]: { ...win, minimized: !win.minimized } };
+    });
+  };
+
+  const updateTerminalBounds = (id: string, bounds: TerminalBounds) => {
+    setTerminalWindows(prev => {
+      const win = prev[id];
+      if (!win) return prev;
+      return { ...prev, [id]: { ...win, ...bounds } };
+    });
+  };
 
   useEffect(() => window.electronAPI?.onTaskUpdate(({ id, status, command }) => {
     setTasks(prev => prev.map(t => t.id === id ? { ...t, status: status as TaskStatus, ...(command ? { command } : {}) } : t));
-  }), []);
+    if (status === 'running') openTerminal(id);
+  }), [openTerminal]);
   useEffect(() => window.electronAPI?.onTaskLog(({ id, line }) => {
     setLogs(prev => [...prev, { id, line }]);
+  }), []);
+  useEffect(() => window.electronAPI?.onReportCreated(({ id, reportPath }) => {
+    setReports(prev => ({ ...prev, [id]: reportPath }));
   }), []);
   useEffect(() => { if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight; }, [messages, logs]);
 
@@ -111,6 +212,7 @@ function App() {
     const task = tasks.find(t => t.id === id);
     if (!task || task.status !== 'pending') return;
     setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'running' } : t));
+    openTerminal(id);
     if (!window.electronAPI) {
       setTasks(prev => prev.map(t => t.id === id ? { ...t, command: task.type === 'winget_install' ? `winget install --id ${task.params.id} --silent` : task.type } : t));
       setLogs(prev => [...prev, { id, line: `Simulated ${task.type}: ${JSON.stringify(task.params)}\n` }]);
@@ -121,6 +223,24 @@ function App() {
     if (!r.success) {
       setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'failed' } : t));
       setLogs(prev => [...prev, { id, line: `[error] ${r.error}\n` }]);
+    }
+  };
+
+  const openReport = async (id: string) => {
+    const reportPath = reports[id];
+    if (!reportPath || !window.electronAPI?.openReport) return;
+    const r = await window.electronAPI.openReport(reportPath);
+    if (!r.success) {
+      setLogs(prev => [...prev, { id, line: `[error] Could not open report: ${r.error}\n` }]);
+    }
+  };
+
+  const openReportFolder = async (id: string) => {
+    const reportPath = reports[id];
+    if (!reportPath || !window.electronAPI?.openReportFolder) return;
+    const r = await window.electronAPI.openReportFolder(reportPath);
+    if (!r.success) {
+      setLogs(prev => [...prev, { id, line: `[error] Could not open report folder: ${r.error}\n` }]);
     }
   };
 
@@ -190,19 +310,52 @@ function App() {
                   {t.params.id && <p><strong>Winget ID:</strong> <code>{t.params.id}</code></p>}
                   {t.note && <p><strong>Note:</strong> {t.note}</p>}
                   {t.command && <div className="command-line">{t.command}</div>}
-                  {logs.filter(l => l.id === t.id).length > 0 && (
-                    <div className="log-panel">{logs.filter(l => l.id === t.id).map((l, i) => <div key={i} className="log-line">{l.line}</div>)}</div>
-                  )}
                 </div>
                 <div className="task-actions">
                   {t.status === 'pending' && <button className="approve-btn" onClick={() => run(t.id)}>Approve</button>}
                   {t.status !== 'pending' && <span className={`badge ${t.status}`}>{badge(t.status)}</span>}
+                  {terminalWindows[t.id] && (
+                    <button className="report-btn" onClick={() => openTerminal(t.id)}>Open Terminal</button>
+                  )}
+                  {reports[t.id] && <button className="report-btn" onClick={() => openReport(t.id)}>View Report</button>}
                 </div>
               </div>
             ))}
           </div>
         </section>
       </main>
+
+      {/* Floating terminal windows — only windows with closed === false are
+          rendered. Closed windows keep their full state (logs, bounds,
+          z-index) in terminalWindows and are restored on reopen. The focused
+          window is the one with the highest z-index. */}
+      {Object.entries(terminalWindows)
+        .filter(([, w]) => !w.closed)
+        .map(([id, win]) => {
+          const task = tasks.find(t => t.id === id);
+          if (!task) return null;
+          const maxZ = Math.max(...Object.values(terminalWindows).map(w => w.zIndex));
+          return (
+            <FloatingTerminal
+              key={id}
+              taskId={id}
+              title={`Terminal - ${task.label}`}
+              logs={logs.filter(l => l.id === id).map(l => l.line)}
+              status={task.status}
+              reportPath={reports[id]}
+              bounds={{ x: win.x, y: win.y, width: win.width, height: win.height }}
+              onBoundsChange={b => updateTerminalBounds(id, b)}
+              zIndex={win.zIndex}
+              focused={win.zIndex === maxZ}
+              minimized={win.minimized}
+              onToggleMinimize={() => toggleMinimizeTerminal(id)}
+              onFocus={() => focusTerminal(id)}
+              onClose={() => closeTerminal(id)}
+              onViewReport={() => openReport(id)}
+              onOpenReportFolder={() => openReportFolder(id)}
+            />
+          );
+        })}
     </div>
   );
 }

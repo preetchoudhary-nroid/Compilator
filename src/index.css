@@ -7,15 +7,15 @@
   color: #e8e8f0;
   background-color: #0a0a0f;
 
-  --bg: #0a0a0f;
-  --card: #14141c;
-  --accent: #7c5cff;
-  --accent-glow: rgba(124, 92, 255, 0.35);
+  --bg: #656568;
+  --card: rgba(0, 5, 5, 0.638);
+  --accent: #048e9bea;
+  --accent-glow: rgba(79, 235, 243, 0.638);
   --text: #e8e8f0;
   --text-dim: #8b8b9a;
   --done: #2de08e;
   --running: #ffb347;
-  --border-color: #22222e;
+  --border-color: #222b2e;
   --danger: #da3633;
 }
 

@@ -170,6 +170,7 @@
 }
 
 .task-card {
+  position: relative;
   background: var(--card);
   border: 1px solid #22222e;
   border-radius: 10px;
@@ -250,19 +251,193 @@
   color: var(--accent);
 }
 
-.log-panel {
-  background: #000004;
-  border: 1px solid #1a1a24;
-  border-radius: 8px;
+/* ---------------------------------------------------------------------------
+   FLOATING TERMINAL
+   Desktop-style movable windows rendered inside the React app. Positioned
+   with left/top (absolute), always above app content (z-index), rounded
+   corners + drop shadow. Drag = title bar, Resize = bottom-right handle.
+   The log body remains scrollable (touch-action: pan-y keeps wheel/touch).
+--------------------------------------------------------------------------- */
+.floating-terminal {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  background: #0a0a12;
+  border: 1px solid #2a2a3a;
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  min-width: 360px;
+  min-height: 200px;
+}
+
+.floating-terminal.focused {
+  border-color: var(--accent);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(4, 142, 155, 0.25);
+}
+
+.floating-terminal.minimized {
+  min-height: 0;
+  height: auto;
+}
+
+.floating-terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  cursor: grab;
+  user-select: none;
+  padding: 8px 10px 8px 14px;
+  background: #12121c;
+  border-bottom: 1px solid #2a2a3a;
+  border-radius: 10px 10px 0 0;
+  flex-shrink: 0;
+}
+
+.floating-terminal-header:active {
+  cursor: grabbing;
+}
+
+.floating-terminal-title {
   font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.floating-terminal-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.term-status {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-right: 4px;
+}
+
+.term-status.running {
+  background: rgba(255, 179, 71, 0.12);
+  color: var(--running);
+}
+
+.term-status.done,
+.term-status.already_installed {
+  background: rgba(45, 224, 142, 0.12);
+  color: var(--done);
+}
+
+.term-status.failed {
+  background: rgba(218, 54, 51, 0.14);
+  color: var(--danger);
+}
+
+.term-status.pending {
+  background: rgba(139, 139, 154, 0.14);
+  color: var(--text-dim);
+}
+
+.term-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.term-btn:hover {
+  background: #1c1c28;
+  border-color: var(--border-color);
+  color: var(--text);
+}
+
+.floating-terminal-body {
+  flex: 1;
+  overflow: auto;
+  padding: 12px 14px;
+  background: #000004;
   color: #6be89a;
-  padding: 12px;
-  max-height: 240px;
-  overflow-y: auto;
-  margin-top: 0.6rem;
+  font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
+  touch-action: pan-y;
+}
+
+.log-line {
+  line-height: 1.5;
+  min-height: 1.2em;
+}
+
+.log-line.dim,
+.log-empty {
+  color: var(--text-dim);
+}
+
+.floating-terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #12121c;
+  border-top: 1px solid #2a2a3a;
+  flex-shrink: 0;
+}
+
+.ft-action-btn {
+  font-size: 12px;
+  padding: 4px 12px;
+  background: #1c1c28;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.ft-action-btn:hover {
+  background: #26263a;
+  border-color: var(--accent);
+}
+
+.ft-finished {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.floating-terminal-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 16px;
+  height: 16px;
+  cursor: nwse-resize;
+  touch-action: none;
+  background: linear-gradient(135deg, transparent 55%, var(--text-dim) 55%, var(--text-dim) 65%, transparent 65%, transparent 75%, var(--text-dim) 75%, var(--text-dim) 85%, transparent 85%);
+  opacity: 0.6;
+}
+
+.floating-terminal-resize:hover {
+  opacity: 1;
 }
 
 .task-actions {
@@ -280,6 +455,20 @@
 
 .approve-btn:hover {
   background-color: #6a46f0;
+  border-color: var(--accent);
+}
+
+.report-btn {
+  background-color: #1c1c28;
+  border: 1px solid var(--border-color);
+  color: var(--accent);
+  font-size: 0.85rem;
+  padding: 0.4rem 0.9rem;
+  white-space: nowrap;
+}
+
+.report-btn:hover {
+  background-color: #26263a;
   border-color: var(--accent);
 }
 
