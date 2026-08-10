@@ -192,21 +192,108 @@ async function finishTaskRun(id, { status, exitCode, error }) {
 // ---------------------------------------------------------------------------
 const ALLOWED_TYPES = ['mkdir', 'winget_install', 'winget_list', 'write_file'];
 
-// Confident, real winget package ids only. Never guess.
+// Confident, real winget package ids only. Never guess. Verified against the
+// winget source; more-specific alias keys are listed before generic ones so a
+// phrase like "node lts" prefers OpenJS.NodeJS.LTS over the generic node id.
 const WINGET_CATALOG = {
-  'visual studio code': 'Microsoft.VisualStudioCode',
+  // ---- Development -----------------------------------------------------------
   vscode: 'Microsoft.VisualStudioCode',
+  'visual studio code': 'Microsoft.VisualStudioCode',
   'vs code': 'Microsoft.VisualStudioCode',
+  'node lts': 'OpenJS.NodeJS.LTS',
+  'node.js lts': 'OpenJS.NodeJS.LTS',
+  'nodejs lts': 'OpenJS.NodeJS.LTS',
   node: 'OpenJS.NodeJS',
   nodejs: 'OpenJS.NodeJS',
   'node.js': 'OpenJS.NodeJS',
-  python: 'Python.Python.3.12',
+  'python 3.13': 'Python.Python.3.13',
   'python 3.12': 'Python.Python.3.12',
+  python: 'Python.Python.3.13',
   git: 'Git.Git',
-  chrome: 'Google.Chrome',
-  'google chrome': 'Google.Chrome',
+  'github desktop': 'GitHub.GitHubDesktop',
+  'visual studio 2022 community': 'Microsoft.VisualStudio.2022.Community',
+  'visual studio 2022': 'Microsoft.VisualStudio.2022.Community',
+  java: 'EclipseAdoptium.Temurin.21.JDK',
+  'java jdk': 'EclipseAdoptium.Temurin.21.JDK',
+  jdk: 'EclipseAdoptium.Temurin.21.JDK',
+  temurin: 'EclipseAdoptium.Temurin.21.JDK',
+  'go lang': 'GoLang.Go',
+  golang: 'GoLang.Go',
+  go: 'GoLang.Go',
+  rustup: 'Rustlang.Rustup',
+  rustlang: 'Rustlang.Rustup',
+  rust: 'Rustlang.Rustup',
   docker: 'Docker.DockerDesktop',
   'docker desktop': 'Docker.DockerDesktop',
+  postman: 'Postman.Postman',
+  dbeaver: 'DBeaver.DBeaver.Community',
+  mysql: 'Oracle.MySQL',
+  postgresql: 'PostgreSQL.PostgreSQL',
+  postgres: 'PostgreSQL.PostgreSQL',
+
+  // ---- Developer utilities ---------------------------------------------------
+  '7zip': '7zip.7zip',
+  '7-zip': '7zip.7zip',
+  '7 zip': '7zip.7zip',
+  'powershell 7': 'Microsoft.PowerShell',
+  powershell: 'Microsoft.PowerShell',
+  'windows terminal': 'Microsoft.WindowsTerminal',
+  'notepad++': 'Notepad++.Notepad++',
+  notepad: 'Notepad++.Notepad++',
+  everything: 'voidtools.Everything',
+  winmerge: 'WinMerge.WinMerge',
+  jq: 'jqlang.jq',
+  cmake: 'Kitware.CMake',
+  ninja: 'Ninja-build.Ninja',
+  llvm: 'LLVM.LLVM',
+
+  // ---- Browsers ---------------------------------------------------------------
+  chrome: 'Google.Chrome',
+  'google chrome': 'Google.Chrome',
+  firefox: 'Mozilla.Firefox',
+  edge: 'Microsoft.Edge',
+  'microsoft edge': 'Microsoft.Edge',
+  brave: 'Brave.Brave',
+  opera: 'Opera.Opera',
+  vivaldi: 'Vivaldi.Vivaldi',
+
+  // ---- Design / media ---------------------------------------------------------
+  vlc: 'VideoLAN.VLC',
+  'obs studio': 'OBSProject.OBSStudio',
+  obs: 'OBSProject.OBSStudio',
+  gimp: 'GIMP.GIMP',
+  inkscape: 'Inkscape.Inkscape',
+  blender: 'BlenderFoundation.Blender',
+  audacity: 'Audacity.Audacity',
+  handbrake: 'HandBrake.HandBrake',
+  krita: 'KDE.Krita',
+
+  // ---- Networking / remote administration -------------------------------------
+  wireshark: 'WiresharkFoundation.Wireshark',
+  putty: 'PuTTY.PuTTY',
+  winscp: 'WinSCP.WinSCP',
+  tailscale: 'Tailscale.Tailscale',
+  openvpn: 'OpenVPNTechnologies.OpenVPN',
+  rustdesk: 'RustDesk.RustDesk',
+
+  // ---- Productivity -----------------------------------------------------------
+  libreoffice: 'TheDocumentFoundation.LibreOffice',
+  obsidian: 'Obsidian.Obsidian',
+  notion: 'Notion.Notion',
+  sharex: 'ShareX.ShareX',
+  powertoys: 'Microsoft.PowerToys',
+  'power toys': 'Microsoft.PowerToys',
+
+  // ---- Gaming -----------------------------------------------------------------
+  steam: 'Valve.Steam',
+  'epic games launcher': 'EpicGames.EpicGamesLauncher',
+  'epic games': 'EpicGames.EpicGamesLauncher',
+  epic: 'EpicGames.EpicGamesLauncher',
+  'gog galaxy': 'GOG.Galaxy',
+  gog: 'GOG.Galaxy',
+  'ubisoft connect': 'Ubisoft.Connect',
+  ubisoft: 'Ubisoft.Connect',
+  discord: 'Discord.Discord',
 };
 
 const ESTIMATES = {
@@ -389,7 +476,7 @@ function planFromRequest(request, installed) {
   if (/\b(?:install|set ?up|setup)\b/i.test(text)) {
     pushSkip(
       text || '(empty request)',
-      'I could not figure out which package to install. Supported: vscode, node, python, git, chrome, docker.'
+      'I could not figure out which package to install. I know 50+ verified winget packages (dev tools, browsers, media, networking, productivity, gaming) — try "install <software name>", e.g. "install github desktop".'
     );
     return { tasks, tasks_skipped };
   }

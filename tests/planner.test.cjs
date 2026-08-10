@@ -46,16 +46,34 @@ const CATALOG = {
   'visual studio code': 'Microsoft.VisualStudioCode',
   vscode: 'Microsoft.VisualStudioCode',
   'vs code': 'Microsoft.VisualStudioCode',
+  'node lts': 'OpenJS.NodeJS.LTS',
+  'node.js lts': 'OpenJS.NodeJS.LTS',
   node: 'OpenJS.NodeJS',
   nodejs: 'OpenJS.NodeJS',
   'node.js': 'OpenJS.NodeJS',
-  python: 'Python.Python.3.12',
+  'python 3.13': 'Python.Python.3.13',
   'python 3.12': 'Python.Python.3.12',
+  python: 'Python.Python.3.13',
   git: 'Git.Git',
+  'github desktop': 'GitHub.GitHubDesktop',
+  'go lang': 'GoLang.Go',
+  golang: 'GoLang.Go',
+  go: 'GoLang.Go',
+  rust: 'Rustlang.Rustup',
+  rustup: 'Rustlang.Rustup',
+  rustdesk: 'RustDesk.RustDesk',
+  'gog galaxy': 'GOG.Galaxy',
+  gog: 'GOG.Galaxy',
   chrome: 'Google.Chrome',
   'google chrome': 'Google.Chrome',
   docker: 'Docker.DockerDesktop',
   'docker desktop': 'Docker.DockerDesktop',
+  dbeaver: 'DBeaver.DBeaver.Community',
+  discord: 'Discord.Discord',
+  steam: 'Valve.Steam',
+  blender: 'BlenderFoundation.Blender',
+  'notepad++': 'Notepad++.Notepad++',
+  notepad: 'Notepad++.Notepad++',
 };
 
 let passCount = 0;
@@ -140,12 +158,50 @@ const genericCases = [
   ['install node', 'OpenJS.NodeJS'],
   ['node install krde', 'OpenJS.NodeJS'],
   ['install node.js', 'OpenJS.NodeJS'],
-  ['install python', 'Python.Python.3.12'],
-  ['python install kardo', 'Python.Python.3.12'],
+  ['install python', 'Python.Python.3.13'],
+  ['python install kardo', 'Python.Python.3.13'],
+  ['install python 3.13', 'Python.Python.3.13'],
+  ['install python 3.12', 'Python.Python.3.12'],
   ['install vscode', 'Microsoft.VisualStudioCode'],
   ['set up vscode', 'Microsoft.VisualStudioCode'],
   ['install visual studio code', 'Microsoft.VisualStudioCode'],
   ['install docker desktop', 'Docker.DockerDesktop'],
+  ['install github desktop', 'GitHub.GitHubDesktop'],
+  ['github desktop install', 'GitHub.GitHubDesktop'],
+  ['install visual studio 2022', 'Microsoft.VisualStudio.2022.Community'],
+  ['install node lts', 'OpenJS.NodeJS.LTS'],
+  ['install java', 'EclipseAdoptium.Temurin.21.JDK'],
+  ['install jdk', 'EclipseAdoptium.Temurin.21.JDK'],
+  ['install go', 'GoLang.Go'],
+  ['install golang', 'GoLang.Go'],
+  ['install rust', 'Rustlang.Rustup'],
+  ['install rustup', 'Rustlang.Rustup'],
+  ['install rustdesk', 'RustDesk.RustDesk'],
+  ['install gog galaxy', 'GOG.Galaxy'],
+  ['install dbeaver', 'DBeaver.DBeaver.Community'],
+  ['install postman', 'Postman.Postman'],
+  ['install notepad++', 'Notepad++.Notepad++'],
+  ['install 7zip', '7zip.7zip'],
+  ['install windows terminal', 'Microsoft.WindowsTerminal'],
+  ['install firefox', 'Mozilla.Firefox'],
+  ['install edge', 'Microsoft.Edge'],
+  ['install brave', 'Brave.Brave'],
+  ['install opera', 'Opera.Opera'],
+  ['install vlc', 'VideoLAN.VLC'],
+  ['install obs studio', 'OBSProject.OBSStudio'],
+  ['install blender', 'BlenderFoundation.Blender'],
+  ['install wireshark', 'WiresharkFoundation.Wireshark'],
+  ['install putty', 'PuTTY.PuTTY'],
+  ['install tailscale', 'Tailscale.Tailscale'],
+  ['install openvpn', 'OpenVPNTechnologies.OpenVPN'],
+  ['install libreoffice', 'TheDocumentFoundation.LibreOffice'],
+  ['install obsidian', 'Obsidian.Obsidian'],
+  ['install notion', 'Notion.Notion'],
+  ['install powertoys', 'Microsoft.PowerToys'],
+  ['install steam', 'Valve.Steam'],
+  ['install epic games launcher', 'EpicGames.EpicGamesLauncher'],
+  ['install ubisoft connect', 'Ubisoft.Connect'],
+  ['install discord', 'Discord.Discord'],
 ];
 for (const [input, expected] of genericCases) {
   check(`resolves ${JSON.stringify(input)} -> ${expected}`, () => {
@@ -377,6 +433,38 @@ check('resolveCatalogTarget(chrome) -> Google.Chrome', () => {
   assert.equal(hit.key, 'chrome');
 });
 check('resolveCatalogTarget(photoshop) -> null (never guessed)', () => {
+  assert.equal(resolveCatalogTarget('photoshop', CATALOG), null);
+});
+
+// Token-level matching keeps the large catalog unambiguous: a short alias must
+// never hijack a longer package ("go" vs "gog galaxy", "rust" vs "rustdesk",
+// "git" vs "github desktop"), and punctuation is normalized on both sides
+// ("notepad++" still matches when the target says "notepad").
+console.log('\n[core] token-level catalog matching stays unambiguous');
+[
+  ['go', 'GoLang.Go'],
+  ['gog galaxy', 'GOG.Galaxy'],
+  ['gog', 'GOG.Galaxy'],
+  ['rust', 'Rustlang.Rustup'],
+  ['rustup', 'Rustlang.Rustup'],
+  ['rustdesk', 'RustDesk.RustDesk'],
+  ['git', 'Git.Git'],
+  ['github desktop', 'GitHub.GitHubDesktop'],
+  ['node', 'OpenJS.NodeJS'],
+  ['node lts', 'OpenJS.NodeJS.LTS'],
+  ['notepad', 'Notepad++.Notepad++'],
+  ['notepad++', 'Notepad++.Notepad++'],
+  ['discord', 'Discord.Discord'],
+  ['steam', 'Valve.Steam'],
+  ['dbeaver', 'DBeaver.DBeaver.Community'],
+].forEach(([target, expected]) => {
+  check(`resolveCatalogTarget(${JSON.stringify(target)}) -> ${expected}`, () => {
+    const hit = resolveCatalogTarget(target, CATALOG);
+    assert.ok(hit, `expected a catalog hit for ${JSON.stringify(target)}`);
+    assert.equal(hit.id, expected, `resolved ${JSON.stringify(hit && hit.id)}`);
+  });
+});
+check('resolveCatalogTarget(photoshop) still null in the expanded catalog', () => {
   assert.equal(resolveCatalogTarget('photoshop', CATALOG), null);
 });
 

@@ -188,18 +188,51 @@ function extractInstallTarget(raw) {
 }
 
 /**
+ * Normalize a phrase into comparable word tokens: lowercase and collapse every
+ * run of non-alphanumerics into a single space ("notepad++" -> "notepad",
+ * "7-zip" -> "7 zip", "3.13" -> "3 13"). Alias keys and natural-language
+ * targets therefore compare on equal footing.
+ */
+function tokenizePhrase(raw) {
+  return String(raw || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
  * Match a cleaned target against a verified catalog. Never guesses: returns
  * { key, id } only for a real catalog entry, otherwise null.
  * Catalog shape is key -> string id (main.cjs) OR key -> { id, name } (App.tsx).
+ *
+ * Matching is token-based so the (now large) catalog stays unambiguous:
+ *   - a multi-token key ("gog galaxy") must appear as a contiguous run of
+ *     tokens inside the target, so "go" alone can never resolve to it;
+ *   - a single-token key ("rust", "git", "go") matches only the exact word,
+ *     so "rustdesk" is not hijacked by "rust", "github desktop" is not
+ *     hijacked by "git", and "gog galaxy" is not hijacked by "go".
+ * Punctuation is normalized on both sides first, so "notepad++" style keys
+ * still match even though the target "notepad" lost its "++".
  */
 function resolveCatalogTarget(target, catalog) {
-  const t = String(target || '').trim().toLowerCase();
-  if (!t || !catalog || typeof catalog !== 'object') return null;
+  if (!catalog || typeof catalog !== 'object') return null;
+  const t = tokenizePhrase(target);
+  if (t.length === 0) return null;
+
   for (const [key, value] of Object.entries(catalog)) {
-    if (t.includes(key) || key.includes(t)) {
-      const id = typeof value === 'string' ? value : String((value && value.id) || (value && value.name) || '');
-      if (id) return { key, id };
-    }
+    const k = tokenizePhrase(key);
+    if (k.length === 0) continue;
+
+    const matches =
+      k.length === 1
+        ? t.includes(k[0])
+        : t.some((_, i) => k.every((kt, j) => t[i + j] === kt));
+    if (!matches) continue;
+
+    const id = typeof value === 'string' ? value : String((value && value.id) || (value && value.name) || '');
+    if (id) return { key, id };
   }
   return null;
 }
