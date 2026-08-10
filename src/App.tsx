@@ -1,18 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import './App.css';
 import FloatingTerminal, { type TerminalBounds } from './components/FloatingTerminal';
+import { extractInstallTarget, isNegated, resolveCatalogTarget } from './planner-core.js';
 
 declare global {
   interface Window {
     electronAPI?: {
       executeTask: (p: { taskId: string; type: string; params: Record<string, string> }) => Promise<{ success: boolean; taskId: string; error?: string }>;
-      chatWithAI: (prompt: string) => Promise<{ success: boolean; reply?: string; error?: string; tasks?: PlannerTask[]; tasks_skipped?: SkippedRequest[] }>;
+      chatWithAI: (prompt: string, requestId: string) => Promise<{ success: boolean; requestId: string; error?: string }>;
       wingetList: () => Promise<{ success: boolean; output?: string; error?: string }>;
       openReport: (reportPath: string) => Promise<{ success: boolean; error?: string }>;
       openReportFolder: (reportPath: string) => Promise<{ success: boolean; error?: string }>;
       onTaskUpdate: (cb: (d: { id: string; status: string; command?: string }) => void) => () => void;
       onTaskLog: (cb: (d: { id: string; line: string }) => void) => () => void;
       onReportCreated: (cb: (d: { id: string; reportPath: string }) => void) => () => void;
+      onChatChunk: (cb: (d: { requestId: string; chunk: string; full: string }) => void) => () => void;
+      onChatDone: (cb: (d: { requestId: string; result: { success: boolean; intent: string; reply: string; tasks?: PlannerTask[]; tasks_skipped?: SkippedRequest[]; source?: string } }) => void) => () => void;
     };
   }
 }
@@ -31,7 +34,7 @@ interface PlannerTask {
 interface SkippedRequest { request: string; reason: string }
 interface UiTask extends Omit<PlannerTask, 'status'> { id: string; status: TaskStatus; command?: string }
 interface LogEntry { id: string; line: string }
-interface Message { role: 'user' | 'ai'; text: string }
+interface Message { role: 'user' | 'ai'; text: string; requestId?: string }
 
 const CATALOG: Record<string, { name: string; id: string }> = {
   vscode: { name: 'Visual Studio Code', id: 'Microsoft.VisualStudioCode' },
@@ -45,6 +48,10 @@ const CATALOG: Record<string, { name: string; id: string }> = {
 };
 
 const clean = (s: string) => s.replace(/["']/g, '').replace(/\b(?:named|called)\s+/i, '').trim();
+
+// Install-intent parsing lives in ./planner-core.js (shared with the Electron
+// main-process planner): extractInstallTarget() handles any word order +
+// conversational filler, and isNegated() blocks refusal/cancellation.
 
 const DEFAULT_TERMINAL_BOUNDS = { width: 600, height: 420 };
 
@@ -65,6 +72,13 @@ function browserPlanner(request: string): { tasks: PlannerTask[]; tasks_skipped:
   const tasks_skipped: SkippedRequest[] = [];
   const skip = (r: string, reason: string) => tasks_skipped.push({ request: r, reason });
 
+  // Negation — "i dont want to install chrome", "never mind", "cancel …"
+  // must never create an install.
+  if (isNegated(text)) {
+    skip(text, 'You asked not to install it — no action was planned.');
+    return { tasks, tasks_skipped };
+  }
+
   if (/(list installed|list packages|installed packages|\blist\b)/.test(text)) {
     tasks.push({ type: 'winget_list', label: 'List installed packages', params: {}, estimated_seconds: 15, status: 'pending' });
     return { tasks, tasks_skipped };
@@ -81,12 +95,19 @@ function browserPlanner(request: string): { tasks: PlannerTask[]; tasks_skipped:
     if (p) tasks.push({ type: 'write_file', label: `Write file ${p}`, params: { path: p, content: wr[2] }, estimated_seconds: 3, status: 'pending' });
     return { tasks, tasks_skipped };
   }
-  const ins = text.match(/install\s+(.+)/);
-  if (ins) {
-    const requested = ins[1].trim();
-    const entry = Object.entries(CATALOG).find(([k]) => requested.includes(k) || k.includes(requested));
-    if (entry) tasks.push({ type: 'winget_install', label: `Install ${entry[1].name} (${entry[1].id})`, params: { id: entry[1].id }, estimated_seconds: 180, status: 'pending' });
-    else skip(`install ${requested}`, 'Unknown or unverified winget package id — refusing to guess one.');
+  const insRequested = extractInstallTarget(text);
+  if (insRequested) {
+    const hit = resolveCatalogTarget(insRequested, CATALOG);
+    if (hit) {
+      const meta = CATALOG[hit.key];
+      tasks.push({ type: 'winget_install', label: `Install ${meta.name} (${meta.id})`, params: { id: meta.id }, estimated_seconds: 180, status: 'pending' });
+    } else {
+      skip(`install ${insRequested}`, 'Unknown or unverified winget package id — refusing to guess one.');
+    }
+    return { tasks, tasks_skipped };
+  }
+  if (/\b(?:install|set ?up|setup)\b/i.test(text)) {
+    skip(text, 'I could not figure out which package to install. Supported: vscode, node, python, git, chrome, docker.');
     return { tasks, tasks_skipped };
   }
   skip(text || '(empty request)', 'Does not match any allowed task type (mkdir, winget_install, winget_list, write_file).');
@@ -198,6 +219,33 @@ function App() {
   useEffect(() => window.electronAPI?.onReportCreated(({ id, reportPath }) => {
     setReports(prev => ({ ...prev, [id]: reportPath }));
   }), []);
+
+  // ---- AI chat streaming -------------------------------------------------
+  // The AI provider streams tokens while answering. Chunks update the
+  // placeholder message live; the final `chat:done` event replaces it with
+  // the full reply (or the fallback planner's reply) and integrates any
+  // planned tasks. Events are correlated by requestId so parallel requests
+  // never cross-talk.
+  useEffect(() => {
+    const unsubChunk = window.electronAPI?.onChatChunk(({ requestId, full }) => {
+      setMessages(m => m.map(msg => msg.requestId === requestId ? { ...msg, text: full } : msg));
+    });
+    const unsubDone = window.electronAPI?.onChatDone(({ requestId, result }) => {
+      setSending(false);
+      setMessages(m => m.map(msg => msg.requestId === requestId ? { role: 'ai', text: result.reply, requestId: undefined } : msg));
+      if (result.tasks?.length) {
+        const planned = result.tasks;
+        setTasks(prev => {
+          const map = new Map(prev.map(t => [t.id, t]));
+          planned.forEach((t, i) => map.set(`${t.type}-${Date.now()}-${i}`, { ...t, id: `${t.type}-${Date.now()}-${i}`, status: t.status }));
+          return [...map.values()];
+        });
+      }
+      if (result.tasks_skipped?.length) setSkipped(result.tasks_skipped);
+    });
+    return () => { unsubChunk?.(); unsubDone?.(); };
+  }, []);
+
   useEffect(() => { if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight; }, [messages, logs]);
 
   const integrate = (plan: PlannerTask[]) => {
@@ -247,26 +295,36 @@ function App() {
   const send = async () => {
     const text = input.trim();
     if (!text || sending) return;
-    setMessages(m => [...m, { role: 'user', text }]);
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    setMessages(m => [...m, { role: 'user', text }, { role: 'ai', text: '', requestId }]);
     setInput('');
     setSending(true);
     try {
       if (window.electronAPI?.chatWithAI) {
-        const r = await window.electronAPI.chatWithAI(text);
-        setMessages(m => [...m, { role: 'ai', text: r.success ? (r.reply ?? 'No tasks planned.') : `Error: ${r.error}` }]);
-        if (r.tasks?.length) integrate(r.tasks);
-        if (r.tasks_skipped?.length) setSkipped(r.tasks_skipped);
+        // Streaming: the invoke returns immediately; the provider result —
+        // including the final reply and any planned tasks — arrives via the
+        // chat:chunk / chat:done events handled in the effect above.
+        const r = await window.electronAPI.chatWithAI(text, requestId);
+        if (!r.success) {
+          setMessages(m => m.map(msg => msg.requestId === requestId ? { role: 'ai', text: `Error: ${r.error}` } : msg));
+          setSending(false);
+        }
       } else {
+        // Browser demo fallback (no Electron bridge): plan locally.
         const p = browserPlanner(text);
-        const nums = p.tasks.map((t, i) => `${i + 1}. ${t.label}`).join('\n');
-        setMessages(m => [...m, { role: 'ai', text: p.tasks.length ? `I planned ${p.tasks.length} task(s) (browser demo):\n${nums}` : "I couldn't turn that into any tasks." }]);
+        const summary = p.tasks.length
+          ? `I planned ${p.tasks.length} task(s) (browser demo):\n${p.tasks.map((t, i) => `${i + 1}. ${t.label}`).join('\n')}`
+          : p.tasks_skipped.length
+            ? p.tasks_skipped.map(s => `Couldn't plan "${s.request}" — ${s.reason}`).join('\n')
+            : "I couldn't turn that into any tasks.";
+        setMessages(m => m.map(msg => msg.requestId === requestId ? { role: 'ai', text: summary } : msg));
         if (p.tasks.length) integrate(p.tasks);
         if (p.tasks_skipped.length) setSkipped(p.tasks_skipped);
+        setSending(false);
       }
     } catch (e) {
       console.error(e);
-      setMessages(m => [...m, { role: 'ai', text: 'Failed to plan that request.' }]);
-    } finally {
+      setMessages(m => m.map(msg => msg.requestId === requestId ? { role: 'ai', text: 'Failed to plan that request.' } : msg));
       setSending(false);
     }
   };
@@ -295,7 +353,17 @@ function App() {
           {skipped.length > 0 && (
             <div className="skipped-panel">
               <h3>Skipped requests</h3>
-              {skipped.map((s, i) => <div key={i} className="skipped-item"><strong>"{s.request}"</strong> — {s.reason}</div>)}
+              {skipped.map((s, i) => {
+            const requestText = String(s?.request ?? '').trim();
+            const reasonText = String(s?.reason ?? '').trim();
+            return (
+              <div key={i} className="skipped-item">
+                <strong>"{requestText && requestText !== '{}' ? requestText : '(unknown request)'}"</strong>
+                {' — '}
+                {reasonText || 'Unable to create a task from this request.'}
+              </div>
+            );
+          })}
             </div>
           )}
           <div className="task-list">

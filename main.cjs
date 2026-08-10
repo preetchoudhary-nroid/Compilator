@@ -2,53 +2,24 @@ const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const http = require('http');
-const https = require('https');
+const { createAssistant } = require('./ai/index.cjs');
+const {
+  extractInstallTarget,
+  isNegated,
+  resolveCatalogTarget,
+} = require('./src/planner-core.js');
 
 let mainWindow;
 
-function fetchJson(requestUrl, options = {}) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(requestUrl);
-    const lib = url.protocol === 'https:' ? https : http;
-    const body = options.body ? JSON.stringify(options.body) : undefined;
-    const req = lib.request(
-      {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname + url.search,
-        method: options.method || 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(options.headers || {}),
-        },
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
-        res.on('end', () => {
-          try {
-            const json = data ? JSON.parse(data) : {};
-            resolve(json);
-          } catch (err) {
-            reject(err);
-          }
-        });
-      }
-    );
-
-    req.on('error', reject);
-    if (body) {
-      req.write(body);
-    }
-    req.end();
-  });
+// Single reusable AI assistant — wires intent detection, runtime context,
+// dynamic prompt building and the configured provider (Ollama / LM Studio /
+// OpenAI / OpenRouter / Custom) with streaming support.
+let assistant = null;
+function getAssistant() {
+  if (!assistant) assistant = createAssistant({ app });
+  return assistant;
 }
 
-const aiServerUrl = process.env.AI_SERVER_URL || 'http://127.0.0.1:8080/v1/chat/completions';
-const aiModel = process.env.AI_MODEL || 'gemma-3-4b';
 
 // ---------------------------------------------------------------------------
 // REPORT SYSTEM
@@ -168,6 +139,16 @@ async function writeTaskReport(run) {
 // stdout/stderr, timing and failure details without changing the task format.
 const activeTaskRuns = new Map();
 
+// Send a renderer event without throwing when the window is gone. Long-running
+// winget installs can outlive the window, so every renderer send is guarded.
+function safeSend(wc, channel, payload) {
+  try {
+    if (wc && !wc.isDestroyed()) wc.send(channel, payload);
+  } catch {
+    // window may be gone mid-task — ignore
+  }
+}
+
 function startTaskRun(task, wc, command) {
   const run = {
     id: task.id,
@@ -183,7 +164,7 @@ function startTaskRun(task, wc, command) {
     finished: false,
   };
   activeTaskRuns.set(task.id, run);
-  wc.send('task:update', { id: task.id, status: 'running', command });
+  safeSend(wc, 'task:update', { id: task.id, status: 'running', command });
   return run;
 }
 
@@ -196,13 +177,8 @@ async function finishTaskRun(id, { status, exitCode, error }) {
   run.error = error || run.error || null;
   run.finishedAt = new Date();
   const reportPath = await writeTaskReport(run);
-  try {
-    if (run.wc && !run.wc.isDestroyed() && reportPath) {
-      run.wc.send('task:reportCreated', { id, reportPath });
-    }
-  } catch (err) {
-    console.error('Failed to emit task:reportCreated:', err);
-  }
+  if (reportPath) safeSend(run.wc, 'task:reportCreated', { id, reportPath });
+  else if (!run.wc || run.wc.isDestroyed()) console.warn('Main window closed before report for task', id, 'was delivered.');
   activeTaskRuns.delete(id);
 }
 
@@ -269,6 +245,12 @@ function cleanPath(raw) {
     .trim();
 }
 
+// Install-intent parsing lives in src/planner-core.js (shared with the
+// browser-fallback planner in App.tsx): extractInstallTarget() handles any
+// word order + conversational filler ("chrome install krde bhai",
+// "chrome setup kar do"), and isNegated() blocks refusal/cancellation. We only
+// build tasks for packages verified in WINGET_CATALOG — never guessed ones.
+
 function planFromRequest(request, installed) {
   const text = (request || '').toLowerCase().trim();
   const tasks = [];
@@ -277,6 +259,14 @@ function planFromRequest(request, installed) {
   const pushSkip = (reqText, reason) => {
     tasks_skipped.push({ request: reqText, reason });
   };
+
+  // ---- refusal / negation ------------------------------------------------
+  // "i dont want to install X", "don't install chrome", "never mind",
+  // "cancel the chrome installation" — never plan these.
+  if (isNegated(text)) {
+    pushSkip(request || '(empty request)', 'You asked not to install it — no action was planned.');
+    return { tasks, tasks_skipped };
+  }
 
   // ---- winget_list -------------------------------------------------------
   if (/(list installed|list packages|what's installed|what.*installed|installed packages|\blist\b)/.test(text)) {
@@ -372,18 +362,18 @@ function planFromRequest(request, installed) {
   }
 
   // ---- winget_install ----------------------------------------------------
-  const installMatch = text.match(/install\s+(.+)/);
-  if (installMatch) {
-    const requested = installMatch[1].trim();
-    const entry = Object.entries(WINGET_CATALOG).find(
-      ([key]) => requested.includes(key) || key.includes(requested)
-    );
-    if (entry) {
-      const [, id] = entry;
+  // Accepts natural phrasing: "install git", "git install", "chrome install krde bhai",
+  // "install git please", "chrome setup kar do". Filler words are stripped by the
+  // shared parser core before matching against the verified catalog.
+  const requested = extractInstallTarget(text);
+  if (requested) {
+    const catalogHit = resolveCatalogTarget(requested, WINGET_CATALOG);
+    if (catalogHit) {
+      const { key, id } = catalogHit;
       const installedPkg = findInstalled(installed, id);
       tasks.push({
         type: 'winget_install',
-        label: `Install ${entry[0]} (${id})`,
+        label: `Install ${key} (${id})`,
         params: { id },
         estimated_seconds: installedPkg ? 0 : ESTIMATES.winget_install,
         status: installedPkg ? 'already_installed' : 'pending',
@@ -392,6 +382,15 @@ function planFromRequest(request, installed) {
       return { tasks, tasks_skipped };
     }
     pushSkip(`install ${requested}`, 'Unknown or unverified winget package id — refusing to guess one.');
+    return { tasks, tasks_skipped };
+  }
+
+  // An install-ish request we could not pin down — explain what we support.
+  if (/\b(?:install|set ?up|setup)\b/i.test(text)) {
+    pushSkip(
+      text || '(empty request)',
+      'I could not figure out which package to install. Supported: vscode, node, python, git, chrome, docker.'
+    );
     return { tasks, tasks_skipped };
   }
 
@@ -416,9 +415,160 @@ function summarizePlan(plan) {
     });
   }
   if (tasks_skipped.length > 0) {
-    lines.push(`Skipped ${tasks_skipped.length} request(s): ${tasks_skipped.map((s) => s.request).join(', ')}`);
+    const shown = tasks_skipped.map((s) => {
+      const text = String((s && s.request) || '').trim();
+      return text && text !== '{}' ? text : '(unknown request)';
+    });
+    lines.push(`Skipped ${tasks_skipped.length} request(s): ${shown.join(', ')}`);
   }
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Validate + normalize a model-generated task plan. Enforces the allowed task
+// types, a 5-task cap, real winget ids only, and re-checks installed packages.
+function normalizePlannerPlan(plan, installed) {
+  const tasks = [];
+  const tasks_skipped = [];
+  const seen = new Set();
+  const validWingetIds = new Set(Object.values(WINGET_CATALOG).map((id) => id.toLowerCase()));
+
+  const rawTasks = Array.isArray(plan && plan.tasks) ? plan.tasks : [];
+  for (const raw of rawTasks.slice(0, 5)) {
+    const type = String(raw.type || '');
+    const label = String(raw.label || `${type} ${JSON.stringify(raw.params || {})}`);
+
+    if (!ALLOWED_TYPES.includes(type)) {
+      tasks_skipped.push({ request: label, reason: `Unknown task type: ${type}` });
+      continue;
+    }
+
+    const params = { ...(raw.params || {}) };
+    if (type === 'mkdir' || type === 'write_file') {
+      params.path = cleanPath(String(params.path || ''));
+      if (!params.path) {
+        tasks_skipped.push({ request: label, reason: 'Missing path.' });
+        continue;
+      }
+    }
+    if (type === 'write_file') {
+      params.content = String(params.content ?? '');
+    }
+    if (type === 'winget_install') {
+      params.id = String(params.id || '');
+      if (!params.id || !validWingetIds.has(params.id.toLowerCase())) {
+        tasks_skipped.push({ request: label, reason: 'Unknown or unverified winget package id — refusing to guess one.' });
+        continue;
+      }
+    }
+
+    const dedupeKey = `${type}:${JSON.stringify(params)}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const task = {
+      type,
+      label,
+      params,
+      estimated_seconds: ESTIMATES[type] || 3,
+      status: 'pending',
+    };
+
+    if (type === 'winget_install') {
+      const installedPkg = findInstalled(installed, params.id);
+      if (installedPkg) {
+        task.estimated_seconds = 0;
+        task.status = 'already_installed';
+        task.note = `Already installed (version ${installedPkg.version})`;
+      }
+    }
+    tasks.push(task);
+  }
+
+  const rawSkipped = Array.isArray(plan && plan.tasks_skipped) ? plan.tasks_skipped : [];
+  for (const skipped of rawSkipped) {
+    if (skipped && skipped.request) {
+      tasks_skipped.push({ request: String(skipped.request), reason: String(skipped.reason || 'No reason given') });
+    }
+  }
+  return { tasks, tasks_skipped };
+}
+
+// ---------------------------------------------------------------------------
+// AI plan → final plan decision.
+// ---------------------------------------------------------------------------
+// A normalized skipped entry is only worth surfacing when it actually names a
+// real request and a real reason. Entries like
+// { request: '{}', reason: 'Unknown task type: ' } are model garbage — the AI
+// returned an empty/hallucinated plan and we must fall back to the built-in
+// planner instead of showing the user "Skipped 1 request(s): {}".
+function isJunkSkipped(entry) {
+  if (!entry || typeof entry !== 'object') return true;
+  const request = String(entry.request == null ? '' : entry.request).trim();
+  const reason = String(entry.reason == null ? '' : entry.reason).trim();
+  // The request text vanished ("{}") — no way to explain anything.
+  if (!request || /^[{}[\]]+$/.test(request)) return true;
+  // The type slot was empty ("Unknown task type: ") — an empty hallucinated
+  // task entry, not a real explanation.
+  if (!reason || /^unknown task type:?\s*$/i.test(reason)) return true;
+  return false;
+}
+
+/**
+ * Decide the final plan for a TASK-intent request.
+ *
+ * The AI model's plan is used ONLY when it contains real content (≥1 valid
+ * task or an informative skipped entry). When the model returns empty or
+ * hallucinated JSON — `{}`, `{"tasks":[]}`, `{"tasks":[{}]}`, `{"tasks":[],
+ * "tasks_skipped":[]}` — which small local models do routinely, we fall back
+ * to the deterministic built-in planner so a perfectly valid request like
+ * "chrome install pls" is never lost as "{}".
+ *
+ * Refusal/cancellation is always decided from the user's own words first, so
+ * "I don't want to install chrome" can never produce an install task even if
+ * the model hallucinated one.
+ */
+function resolveAiPlan(result, prompt, installed) {
+  if (isNegated(prompt || '')) {
+    const refused = planFromRequest(prompt || '', installed);
+    return {
+      tasks: refused.tasks,
+      tasks_skipped: refused.tasks_skipped,
+      reply: summarizePlan(refused),
+      source: 'planner',
+    };
+  }
+
+  const normalized = normalizePlannerPlan(result.plan || {}, installed);
+  const hasRealContent =
+    normalized.tasks.length > 0 ||
+    normalized.tasks_skipped.some((s) => !isJunkSkipped(s));
+
+  if (hasRealContent) {
+    return {
+      tasks: normalized.tasks,
+      tasks_skipped: normalized.tasks_skipped,
+      reply: summarizePlan(normalized),
+      source: 'server',
+    };
+  }
+
+  // Empty/hallucinated AI plan — fall back to the built-in planner.
+  const fallback = planFromRequest(prompt || '', installed);
+  if (fallback.tasks.length > 0 || fallback.tasks_skipped.length > 0) {
+    return {
+      tasks: fallback.tasks,
+      tasks_skipped: fallback.tasks_skipped,
+      reply: summarizePlan(fallback),
+      source: 'planner',
+    };
+  }
+  return {
+    tasks: [],
+    tasks_skipped: [],
+    reply: "I couldn't turn that into any tasks.",
+    source: 'planner',
+  };
 }
 
 // Run "winget list" and return parsed installed packages (best effort).
@@ -461,22 +611,22 @@ function streamWinget(task, wc, args, command, logPrefix) {
   const proc = spawn('winget', args);
   proc.stdout.on('data', (data) => {
     run.stdout.push(data.toString());
-    wc.send('task:log', { id: task.id, line: data.toString() });
+    safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
   });
   proc.stderr.on('data', (data) => {
     run.stderr.push(data.toString());
-    wc.send('task:log', { id: task.id, line: data.toString() });
+    safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
   });
   proc.on('error', (err) => {
     run.error = err;
-    wc.send('task:log', { id: task.id, line: `\n[error] ${err.message}\n` });
-    wc.send('task:update', { id: task.id, status: 'failed' });
+    safeSend(wc, 'task:log', { id: task.id, line: `\n[error] ${err.message}\n` });
+    safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
     finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
   });
   proc.on('close', (code) => {
-    wc.send('task:log', { id: task.id, line: logPrefix ? `${logPrefix} exit code ${code}\n` : '' });
+    safeSend(wc, 'task:log', { id: task.id, line: logPrefix ? `${logPrefix} exit code ${code}\n` : '' });
     const status = code === 0 ? 'done' : 'failed';
-    wc.send('task:update', { id: task.id, status, exitCode: code });
+    safeSend(wc, 'task:update', { id: task.id, status, exitCode: code });
     finishTaskRun(task.id, { status, exitCode: code, error: status === 'failed' ? new Error(`Process exited with code ${code}`) : null });
   });
 }
@@ -495,13 +645,13 @@ const TASK_RUNNERS = {
     try {
       await fs.promises.mkdir(task.params.path, { recursive: true });
       run.stdout.push(`Created folder: ${task.params.path}\n`);
-      wc.send('task:log', { id: task.id, line: `Created folder: ${task.params.path}\n` });
-      wc.send('task:update', { id: task.id, status: 'done' });
+      safeSend(wc, 'task:log', { id: task.id, line: `Created folder: ${task.params.path}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'done' });
       finishTaskRun(task.id, { status: 'done', exitCode: 0, error: null });
     } catch (err) {
       run.error = err;
-      wc.send('task:log', { id: task.id, line: `[error] ${err.message}\n` });
-      wc.send('task:update', { id: task.id, status: 'failed' });
+      safeSend(wc, 'task:log', { id: task.id, line: `[error] ${err.message}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
       finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
     }
   },
@@ -513,13 +663,13 @@ const TASK_RUNNERS = {
       await fs.promises.mkdir(dir, { recursive: true });
       await fs.promises.writeFile(task.params.path, task.params.content ?? '', 'utf8');
       run.stdout.push(`Wrote ${task.params.content?.length ?? 0} bytes to ${task.params.path}\n`);
-      wc.send('task:log', { id: task.id, line: `Wrote ${task.params.content?.length ?? 0} bytes to ${task.params.path}\n` });
-      wc.send('task:update', { id: task.id, status: 'done' });
+      safeSend(wc, 'task:log', { id: task.id, line: `Wrote ${task.params.content?.length ?? 0} bytes to ${task.params.path}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'done' });
       finishTaskRun(task.id, { status: 'done', exitCode: 0, error: null });
     } catch (err) {
       run.error = err;
-      wc.send('task:log', { id: task.id, line: `[error] ${err.message}\n` });
-      wc.send('task:update', { id: task.id, status: 'failed' });
+      safeSend(wc, 'task:log', { id: task.id, line: `[error] ${err.message}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
       finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
     }
   },
@@ -615,43 +765,134 @@ ipcMain.handle('open-report-folder', async (event, reportPath) => {
 });
 
 // ---------------------------------------------------------------------------
-// IPC: chat with AI. The built-in planner always runs to convert the prompt
-// into tasks (with already-installed detection). If an external local AI
-// server is reachable, its reply is used for the chat text; otherwise the
-// planner's summary reply is used.
+// IPC: chat with AI.
+//
+// Every request flows through the AI Context System (ai/index.cjs):
+//
+//   User → Intent Detection → AI Context Builder → Prompt Builder
+//        → Provider (Ollama / LM Studio / OpenAI / OpenRouter / Custom)
+//        → Response (streaming or full) → plan validation
+//
+// The assistant classifies each user message as CHAT / TASK / UNKNOWN and
+// replies with either conversational text (CHAT / UNKNOWN) or planner JSON
+// (TASK).
+//
+//   - CHAT / UNKNOWN → natural-language streaming reply, NO tasks created.
+//   - TASK → the JSON plan is re-validated against the allowed task types,
+//            real winget ids, the 5-task cap and installed package state,
+//            then returned as task cards.
+//
+// Streaming chunks are forwarded to the renderer as `chat:chunk`; the final
+// result (including the fallback-planner path) arrives as `chat:done`. The
+// renderer correlates events with the free-form `requestId` we pass along.
+//
+// If the AI provider is unreachable, the built-in planner handles real
+// computer-task requests; conversational input gets a friendly reply.
 // ---------------------------------------------------------------------------
-ipcMain.handle('chat-with-ai', async (event, prompt) => {
+ipcMain.handle('chat-with-ai', async (event, { prompt, requestId }) => {
   const installed = await getInstalledPackages();
-  const plan = planFromRequest(prompt, installed);
-  const fallbackReply = summarizePlan(plan);
+  const wc = event.sender;
+  const reqId = String(requestId || `req_${Date.now()}`);
+
+  // Forward every streamed token to the renderer immediately.
+  const sendChunk = (chunk, full) => {
+    try {
+      if (!wc.isDestroyed()) wc.send('chat:chunk', { requestId: reqId, chunk, full });
+    } catch {
+      // window may be gone mid-stream — ignore
+    }
+  };
 
   try {
-    console.log(`Sending prompt to local AI server: ${prompt}`);
-    const response = await fetchJson(aiServerUrl, {
-      method: 'POST',
-      body: {
-        model: aiModel,
-        messages: [{ role: 'user', content: prompt }],
-      },
+    console.log(`Sending prompt to AI provider: ${prompt}`);
+
+    const result = await getAssistant().ask(prompt, {
+      installedPackages: installed,
+      onChunk: sendChunk,
     });
 
-    const reply =
-      response?.choices?.[0]?.message?.content || response?.choices?.[0]?.text || '';
-    return {
+    if (!result.success) {
+      throw new Error(result.error || 'AI provider request failed');
+    }
+
+    // TASK — the assistant parsed planner JSON. Re-validate against the
+    // allowed types, verified winget ids, the 5-task cap and installed
+    // package state, then surface as cards with a readable summary. When the
+    // model's plan turns out empty/hallucinated ({} / []), fall back to the
+    // built-in planner so the user's real request is never lost.
+    let tasks = [];
+    let tasks_skipped = [];
+    let reply = result.reply;
+    let source = 'server';
+
+    if (result.intent === 'TASK') {
+      const resolved = resolveAiPlan(result, prompt || '', installed);
+      tasks = resolved.tasks;
+      tasks_skipped = resolved.tasks_skipped;
+      reply = resolved.reply;
+      source = resolved.source;
+    }
+
+    const done = {
       success: true,
-      reply: reply || fallbackReply,
-      tasks: plan.tasks,
-      tasks_skipped: plan.tasks_skipped,
-      source: reply ? 'server' : 'planner',
+      intent: result.intent,
+      reply,
+      tasks,
+      tasks_skipped,
+      source,
     };
+
+    if (!wc.isDestroyed()) wc.send('chat:done', { requestId: reqId, result: done });
+    return { success: true, requestId: reqId };
   } catch (error) {
-    console.warn('AI server unreachable, using planner reply:', error?.message || error);
-    return {
-      success: true,
-      reply: fallbackReply,
-      tasks: plan.tasks,
-      tasks_skipped: plan.tasks_skipped,
-      source: 'planner',
-    };
+    console.warn('AI provider unreachable, using built-in planner:', error?.message || error);
+
+    // Offline fallback: the built-in planner only handles real computer-task
+    // requests; everything else stays conversational.
+    const plan = planFromRequest(prompt || '', installed);
+    let result;
+    // Surface the plan even when it only contains skipped requests, so the user
+    // always sees *why* nothing was planned.
+    if (plan.tasks.length > 0 || plan.tasks_skipped.length > 0) {
+      result = {
+        success: true,
+        intent: 'TASK',
+        reply: summarizePlan(plan),
+        tasks: plan.tasks,
+        tasks_skipped: plan.tasks_skipped,
+        source: 'planner',
+      };
+    } else {
+      result = {
+        success: true,
+        intent: 'CHAT',
+        reply:
+          "Hello! I'm Compilator, your desktop assistant. My local AI model isn't connected right now, " +
+          "but I can still plan computer tasks like installing Git, creating folders, writing files, " +
+          'or listing installed packages. What would you like to do?',
+        tasks: [],
+        tasks_skipped: [],
+        source: 'planner',
+      };
+    }
+
+    if (!wc.isDestroyed()) wc.send('chat:done', { requestId: reqId, result });
+    return { success: true, requestId: reqId };
   }
 });
+
+// ---------------------------------------------------------------------------
+// Internal API exposed only for smoke tests. The Electron main entry never
+// consumes these exports, so this is inert at runtime.
+// ---------------------------------------------------------------------------
+module.exports._internal = {
+  planFromRequest,
+  normalizePlannerPlan,
+  resolveAiPlan,
+  isJunkSkipped,
+  summarizePlan,
+  cleanPath,
+  extractInstallTarget,
+  isNegated,
+};
+
