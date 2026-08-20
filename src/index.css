@@ -4,19 +4,20 @@
   font-weight: 400;
 
   color-scheme: dark;
-  color: #e8e8f0;
-  background-color: #0a0a0f;
+  color: #ffffff;
+  background-color: #000000;
 
-  --bg: #656568;
-  --card: rgba(0, 5, 5, 0.638);
-  --accent: #048e9bea;
-  --accent-glow: rgba(79, 235, 243, 0.638);
-  --text: #e8e8f0;
-  --text-dim: #8b8b9a;
-  --done: #2de08e;
-  --running: #ffb347;
-  --border-color: #222b2e;
-  --danger: #da3633;
+  --bg: #000000;
+  --card: #111111;
+  --accent: #ffffff;
+  --accent-glow: rgba(255, 255, 255, 0.2);
+  --text: #ffffff;
+  --text-dim: #888888;
+  --done: #ffffff;
+  --running: #cccccc;
+  --cancelled: #666666;
+  --border-color: #333333;
+  --danger: #ffffff;
 }
 
 body {
@@ -25,6 +26,7 @@ body {
   place-items: center;
   min-width: 320px;
   min-height: 100vh;
+  background-color: #0a0a0f;
 }
 
 h1, h2, h3 {

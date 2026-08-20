@@ -88,6 +88,11 @@ function buildReport(run) {
   lines.push('Status:');
   lines.push(statusLabel);
   lines.push('');
+  if (run.status === 'cancelled') {
+    lines.push('Note:');
+    lines.push('This task was cancelled by the user before it could complete.');
+    lines.push('');
+  }
   lines.push('Command:');
   lines.push(run.task.command || '(none)');
   lines.push('');
@@ -139,6 +144,11 @@ async function writeTaskReport(run) {
 // stdout/stderr, timing and failure details without changing the task format.
 const activeTaskRuns = new Map();
 
+// Currently-spawned winget child processes keyed by task id. A proc is added
+// on spawn and removed again on close/error (or when cancel kills it) so a
+// running task can be stopped on demand via the task:cancel IPC handler.
+const runningProcesses = new Map();
+
 // Send a renderer event without throwing when the window is gone. Long-running
 // winget installs can outlive the window, so every renderer send is guarded.
 function safeSend(wc, channel, payload) {
@@ -162,6 +172,7 @@ function startTaskRun(task, wc, command) {
     exitCode: null,
     finishedAt: null,
     finished: false,
+    cancelled: false,
   };
   activeTaskRuns.set(task.id, run);
   safeSend(wc, 'task:update', { id: task.id, status: 'running', command });
@@ -332,6 +343,27 @@ function cleanPath(raw) {
     .trim();
 }
 
+// Security: Validate and sanitize file paths to prevent directory traversal attacks
+function sanitizePath(rawPath) {
+  const cleaned = cleanPath(rawPath);
+  
+  // Prevent directory traversal
+  if (cleaned.includes('..') || cleaned.includes('~') || cleaned.startsWith('/')) {
+    throw new Error('Invalid path: directory traversal and absolute paths are not allowed');
+  }
+  
+  // Prevent access to sensitive system directories
+  const sensitiveDirs = ['windows', 'program files', 'system32', 'boot', 'etc'];
+  const lowerPath = cleaned.toLowerCase();
+  for (const dir of sensitiveDirs) {
+    if (lowerPath.includes(dir)) {
+      throw new Error(`Invalid path: access to ${dir} is not allowed`);
+    }
+  }
+  
+  return cleaned;
+}
+
 // Install-intent parsing lives in src/planner-core.js (shared with the
 // browser-fallback planner in App.tsx): extractInstallTarget() handles any
 // word order + conversational filler ("chrome install krde bhai",
@@ -370,15 +402,19 @@ function planFromRequest(request, installed) {
   // ---- mkdir -------------------------------------------------------------
   const mkdirMatch = text.match(/(?:mkdir|create folder|create directory|make folder|make directory|new folder)\s+(.+)/);
   if (mkdirMatch) {
-    const folderPath = cleanPath(mkdirMatch[1]);
-    if (folderPath) {
-      tasks.push({
-        type: 'mkdir',
-        label: `Create folder ${folderPath}`,
-        params: { path: folderPath },
-        estimated_seconds: ESTIMATES.mkdir,
-        status: 'pending',
-      });
+    try {
+      const folderPath = sanitizePath(mkdirMatch[1]);
+      if (folderPath) {
+        tasks.push({
+          type: 'mkdir',
+          label: `Create folder ${folderPath}`,
+          params: { path: folderPath },
+          estimated_seconds: ESTIMATES.mkdir,
+          status: 'pending',
+        });
+      }
+    } catch (err) {
+      pushSkip(text || '(empty request)', `Invalid folder path: ${err.message}`);
     }
     return { tasks, tasks_skipped };
   }
@@ -388,30 +424,38 @@ function planFromRequest(request, installed) {
     /(?:write|create|save)\s+(?:a |the )?(?:file\s+)?(.+?)\s+(?:with|containing|content|that says|:)\s*([\s\S]*)/
   );
   if (writeMatch) {
-    const filePath = cleanPath(writeMatch[1]);
-    const content = writeMatch[2];
-    if (filePath) {
-      tasks.push({
-        type: 'write_file',
-        label: `Write file ${filePath}`,
-        params: { path: filePath, content },
-        estimated_seconds: ESTIMATES.write_file,
-        status: 'pending',
-      });
+    try {
+      const filePath = sanitizePath(writeMatch[1]);
+      const content = writeMatch[2];
+      if (filePath) {
+        tasks.push({
+          type: 'write_file',
+          label: `Write file ${filePath}`,
+          params: { path: filePath, content },
+          estimated_seconds: ESTIMATES.write_file,
+          status: 'pending',
+        });
+      }
+    } catch (err) {
+      pushSkip(text || '(empty request)', `Invalid file path: ${err.message}`);
     }
     return { tasks, tasks_skipped };
   }
   const simpleWrite = text.match(/(?:write|create|save)\s+(?:a |the )?(?:file\s+)?["']?([^"']+)["']?\s*$/);
   if (simpleWrite && /write|create|save/.test(text)) {
-    const filePath = cleanPath(simpleWrite[1]);
-    if (filePath) {
-      tasks.push({
-        type: 'write_file',
-        label: `Write file ${filePath}`,
-        params: { path: filePath, content: '' },
-        estimated_seconds: ESTIMATES.write_file,
-        status: 'pending',
-      });
+    try {
+      const filePath = sanitizePath(simpleWrite[1]);
+      if (filePath) {
+        tasks.push({
+          type: 'write_file',
+          label: `Write file ${filePath}`,
+          params: { path: filePath, content: '' },
+          estimated_seconds: ESTIMATES.write_file,
+          status: 'pending',
+        });
+      }
+    } catch (err) {
+      pushSkip(text || '(empty request)', `Invalid file path: ${err.message}`);
     }
     return { tasks, tasks_skipped };
   }
@@ -532,9 +576,14 @@ function normalizePlannerPlan(plan, installed) {
 
     const params = { ...(raw.params || {}) };
     if (type === 'mkdir' || type === 'write_file') {
-      params.path = cleanPath(String(params.path || ''));
-      if (!params.path) {
-        tasks_skipped.push({ request: label, reason: 'Missing path.' });
+      try {
+        params.path = sanitizePath(String(params.path || ''));
+        if (!params.path) {
+          tasks_skipped.push({ request: label, reason: 'Missing path.' });
+          continue;
+        }
+      } catch (err) {
+        tasks_skipped.push({ request: label, reason: `Invalid path: ${err.message}` });
         continue;
       }
     }
@@ -696,6 +745,10 @@ async function getInstalledPackages() {
 function streamWinget(task, wc, args, command, logPrefix) {
   const run = startTaskRun(task, wc, command);
   const proc = spawn('winget', args);
+
+  // Track the process so it can be cancelled on demand.
+  runningProcesses.set(task.id, proc);
+
   proc.stdout.on('data', (data) => {
     run.stdout.push(data.toString());
     safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
@@ -705,12 +758,30 @@ function streamWinget(task, wc, args, command, logPrefix) {
     safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
   });
   proc.on('error', (err) => {
+    // If the task was cancelled, treat the error as expected (SIGTERM etc.)
+    // and report 'cancelled' instead of 'failed'.
+    runningProcesses.delete(task.id);
+    if (run.cancelled) {
+      run.error = err;
+      safeSend(wc, 'task:log', { id: task.id, line: `\n[cancelled] ${err.message}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'cancelled' });
+      finishTaskRun(task.id, { status: 'cancelled', exitCode: null, error: err });
+      return;
+    }
     run.error = err;
     safeSend(wc, 'task:log', { id: task.id, line: `\n[error] ${err.message}\n` });
     safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
     finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
   });
   proc.on('close', (code) => {
+    runningProcesses.delete(task.id);
+    // If the task was cancelled, report 'cancelled' regardless of exit code.
+    if (run.cancelled) {
+      safeSend(wc, 'task:log', { id: task.id, line: logPrefix ? `${logPrefix} exit code ${code} (cancelled)\n` : '' });
+      safeSend(wc, 'task:update', { id: task.id, status: 'cancelled', exitCode: code });
+      finishTaskRun(task.id, { status: 'cancelled', exitCode: code, error: new Error('User cancelled') });
+      return;
+    }
     safeSend(wc, 'task:log', { id: task.id, line: logPrefix ? `${logPrefix} exit code ${code}\n` : '' });
     const status = code === 0 ? 'done' : 'failed';
     safeSend(wc, 'task:update', { id: task.id, status, exitCode: code });
@@ -829,6 +900,23 @@ ipcMain.handle('execute-task', async (event, payload) => {
 });
 
 // ---------------------------------------------------------------------------
+// IPC: cancel a running task.
+// ---------------------------------------------------------------------------
+ipcMain.handle('task:cancel', async (event, { taskId }) => {
+  const proc = runningProcesses.get(taskId);
+  if (!proc) {
+    // Process already finished, never started, or not a winget task.
+    return { success: true, taskId, cancelled: false, reason: 'not running' };
+  }
+  // Mark the run as cancelled so the error/close handlers emit 'cancelled'.
+  const run = activeTaskRuns.get(taskId);
+  if (run) run.cancelled = true;
+  // Send SIGTERM to the child process (and its children on Windows).
+  proc.kill('SIGTERM');
+  return { success: true, taskId, cancelled: true };
+});
+
+// ---------------------------------------------------------------------------
 // IPC: open a generated report file with the OS default application.
 // ---------------------------------------------------------------------------
 ipcMain.handle('open-report', async (event, reportPath) => {
@@ -934,6 +1022,17 @@ ipcMain.handle('chat-with-ai', async (event, { prompt, requestId }) => {
   } catch (error) {
     console.warn('AI provider unreachable, using built-in planner:', error?.message || error);
 
+    // Build a short suggestion when the error looks like a refused connection.
+    const emsg = String(error?.message || '');
+    let suggestion = '';
+    try {
+      if (emsg.includes('ECONNREFUSED') || emsg.includes('connect ECONNREFUSED') || emsg.includes('Could not connect to AI server')) {
+        suggestion = '\n\nTip: Connection to the configured AI server was refused. Ensure your OmniRoute/ClIne provider is running, or update the AI_SERVER_URL to a reachable endpoint.';
+      }
+    } catch {
+      suggestion = '';
+    }
+
     // Offline fallback: the built-in planner only handles real computer-task
     // requests; everything else stays conversational.
     const plan = planFromRequest(prompt || '', installed);
@@ -944,7 +1043,7 @@ ipcMain.handle('chat-with-ai', async (event, { prompt, requestId }) => {
       result = {
         success: true,
         intent: 'TASK',
-        reply: summarizePlan(plan),
+        reply: summarizePlan(plan) + suggestion,
         tasks: plan.tasks,
         tasks_skipped: plan.tasks_skipped,
         source: 'planner',
@@ -956,7 +1055,7 @@ ipcMain.handle('chat-with-ai', async (event, { prompt, requestId }) => {
         reply:
           "Hello! I'm Compilator, your desktop assistant. My local AI model isn't connected right now, " +
           "but I can still plan computer tasks like installing Git, creating folders, writing files, " +
-          'or listing installed packages. What would you like to do?',
+          'or listing installed packages. What would you like to do?' + suggestion,
         tasks: [],
         tasks_skipped: [],
         source: 'planner',
@@ -979,6 +1078,7 @@ module.exports._internal = {
   isJunkSkipped,
   summarizePlan,
   cleanPath,
+  sanitizePath,
   extractInstallTarget,
   isNegated,
 };

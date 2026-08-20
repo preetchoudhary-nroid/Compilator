@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   executeTask: (payload) => ipcRenderer.invoke('execute-task', payload),
+  cancelTask: (taskId) => ipcRenderer.invoke('task:cancel', { taskId }),
 
   /**
    * Ask the AI assistant. Returns immediately with a requestId; streaming

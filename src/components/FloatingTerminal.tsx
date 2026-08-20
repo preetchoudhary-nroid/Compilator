@@ -7,7 +7,7 @@ export interface TerminalBounds {
   height: number;
 }
 
-export type TerminalStatus = 'pending' | 'running' | 'done' | 'failed' | 'already_installed';
+export type TerminalStatus = 'pending' | 'running' | 'done' | 'failed' | 'already_installed' | 'cancelled' | 'cancelling';
 
 interface FloatingTerminalProps {
   taskId: string;
@@ -36,6 +36,8 @@ const STATUS_BADGE: Record<TerminalStatus, string> = {
   done: 'Completed',
   failed: 'Failed',
   already_installed: 'Already Installed',
+  cancelled: 'Cancelled',
+  cancelling: 'Cancelling...',
 };
 
 const clamp = (v: number, min: number, max: number) => Math.min(Math.max(v, min), max);
@@ -186,7 +188,7 @@ export default function FloatingTerminal({
     }
   };
 
-  const isFinished = status === 'done' || status === 'failed' || status === 'already_installed';
+  const isFinished = status === 'done' || status === 'failed' || status === 'already_installed' || status === 'cancelled';
 
   return (
     <div
@@ -258,7 +260,7 @@ export default function FloatingTerminal({
               </>
             )}
             {isFinished && (
-              <span className="ft-finished">Task {status === 'failed' ? 'failed' : 'completed'}</span>
+              <span className="ft-finished">Task {status === 'failed' ? 'failed' : status === 'cancelled' ? 'cancelled' : 'completed'}</span>
             )}
           </div>
 
