@@ -33,6 +33,10 @@ const TASK_MARKERS = {
     /\b(write|create|save|generate|make)\b.*\b(file|readme|config)\b/i,
     /\b(write|create|save|generate)\s+(?:a |the )?file\b/i,
   ],
+  run_python: [
+    /\b(run|execute)\b.*\b(python|script|\.py)\b/i,
+    /\bpython\b.*\b(run|execute|script)\b/i,
+  ],
 };
 
 /** Parse every drive the user mentions (C:/, C:\, /path/...) and return paths. */

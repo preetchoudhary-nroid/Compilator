@@ -55,9 +55,9 @@ const SimpleChart = ({ data, title }: { data: number[]; title: string }) => {
 type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'already_installed' | 'cancelled' | 'cancelling';
 
 interface PlannerTask {
-  type: 'mkdir' | 'winget_install' | 'winget_list' | 'write_file';
+  type: 'mkdir' | 'winget_install' | 'winget_list' | 'write_file' | 'run_python';
   label: string;
-  params: { path?: string; id?: string; content?: string };
+  params: { path?: string; id?: string; content?: string; script_path?: string; args?: string[] };
   estimated_seconds: number;
   status: 'pending' | 'already_installed';
   note?: string;
@@ -192,6 +192,25 @@ const sanitizePath = (rawPath: string): string => {
   return cleaned;
 };
 
+// Split a request into multiple sub-requests using common separators
+function splitMultiCommandRequest(text: string): string[] {
+  const separators = [
+    /\s+and\s+/,
+    /\s+then\s+/,
+    /\s+,/,
+    /\s+;\s*/,
+    /\s+also\s+/,
+    /\s+plus\s+/,
+  ];
+  
+  let parts = [text];
+  for (const sep of separators) {
+    parts = parts.flatMap(part => part.split(sep).map(p => p.trim()).filter(p => p));
+  }
+  
+  return parts;
+}
+
 // Install-intent parsing lives in ./planner-core.js (shared with the Electron
 // main-process planner): extractInstallTarget() handles any word order +
 // conversational filler, and isNegated() blocks refusal/cancellation.
@@ -204,16 +223,37 @@ function browserPlanner(request: string): { tasks: PlannerTask[]; tasks_skipped:
   const tasks_skipped: SkippedRequest[] = [];
   const skip = (r: string, reason: string) => tasks_skipped.push({ request: r, reason });
 
+  // Check if this is a multi-command request
+  const subRequests = splitMultiCommandRequest(text);
+  
+  if (subRequests.length > 1) {
+    // Process each sub-request individually
+    for (const subReq of subRequests) {
+      const subPlan = planSingleRequestBrowser(subReq, skip);
+      tasks.push(...subPlan.tasks);
+    }
+    return { tasks, tasks_skipped };
+  }
+
+  // Process as a single request
+  const singlePlan = planSingleRequestBrowser(text, skip);
+  tasks.push(...singlePlan.tasks);
+  return { tasks, tasks_skipped };
+}
+
+function planSingleRequestBrowser(text: string, skip: (r: string, reason: string) => void): { tasks: PlannerTask[] } {
+  const tasks: PlannerTask[] = [];
+
   // Negation — "i dont want to install chrome", "never mind", "cancel …"
   // must never create an install.
   if (isNegated(text)) {
     skip(text, 'You asked not to install it — no action was planned.');
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
 
   if (/(list installed|list packages|installed packages|\blist\b)/.test(text)) {
     tasks.push({ type: 'winget_list', label: 'List installed packages', params: {}, estimated_seconds: 15, status: 'pending' });
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
   const mk = text.match(/(?:mkdir|create folder|create directory|new folder)\s+(.+)/);
   if (mk) {
@@ -224,7 +264,7 @@ function browserPlanner(request: string): { tasks: PlannerTask[]; tasks_skipped:
       const errorMessage = err instanceof Error ? err.message : String(err);
       skip(text, `Invalid folder path: ${errorMessage}`);
     }
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
   const wr = text.match(/(?:write|create|save)\s+(?:a |the )?(?:file\s+)?(.+?)\s+(?:with|containing|content|:)\s*([\s\S]*)/);
   if (wr) {
@@ -235,7 +275,7 @@ function browserPlanner(request: string): { tasks: PlannerTask[]; tasks_skipped:
       const errorMessage = err instanceof Error ? err.message : String(err);
       skip(text, `Invalid file path: ${errorMessage}`);
     }
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
   const insRequested = extractInstallTarget(text);
   if (insRequested) {
@@ -246,14 +286,38 @@ function browserPlanner(request: string): { tasks: PlannerTask[]; tasks_skipped:
     } else {
       skip(`install ${insRequested}`, 'Unknown or unverified winget package id — refusing to guess one.');
     }
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
   if (/\b(?:install|set ?up|setup)\b/i.test(text)) {
     skip(text, 'I could not figure out which package to install. I know 50+ verified winget packages (dev tools, browsers, media, networking, productivity, gaming) — try "install <software name>", e.g. "install github desktop".');
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
-  skip(text || '(empty request)', 'Does not match any allowed task type (mkdir, winget_install, winget_list, write_file).');
-  return { tasks, tasks_skipped };
+
+  // ---- run_python --------------------------------------------------------
+  const pythonMatch = text.match(/(?:run|execute)\s+(?:python\s+)?(?:script\s+)?(.+?)(?:\s+(?:with|using)\s+(.+))?$/);
+  if (pythonMatch) {
+    try {
+      const scriptPath = pythonMatch[1].trim();
+      const args = pythonMatch[2] ? pythonMatch[2].trim().split(/\s+/) : [];
+      
+      if (scriptPath) {
+        tasks.push({ 
+          type: 'run_python', 
+          label: `Run Python script ${scriptPath}`, 
+          params: { script_path: scriptPath, args }, 
+          estimated_seconds: 30, 
+          status: 'pending' 
+        });
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      skip(text, `Invalid Python script path: ${errorMessage}`);
+    }
+    return { tasks };
+  }
+
+  skip(text || '(empty request)', 'Does not match any allowed task type (mkdir, winget_install, winget_list, write_file, run_python).');
+  return { tasks };
 }
 
 function badge(status: TaskStatus): string {
@@ -273,7 +337,7 @@ function App() {
   const [skipped, setSkipped] = useState<SkippedRequest[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'ai', text: "Hello! I'm the Compilator task planner. Try: 'prepare my AI development pc', 'install git', 'create folder C:/AI', 'write file config.json with hello', or 'list installed packages'." },
+    { role: 'ai', text: "Hello! I'm the Compilator task planner. Try: 'prepare my AI development pc', 'install git', 'create folder C:/AI', 'write file config.json with hello', 'run python script.py', or 'list installed packages'." },
   ]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -281,6 +345,8 @@ function App() {
   const boxRef = useRef<HTMLDivElement>(null);
   const [activeSection, setActiveSection] = useState('components');
   const [showLogs, setShowLogs] = useState(false);
+  const [showCatalog, setShowCatalog] = useState(false);
+  const [selectedSoftware, setSelectedSoftware] = useState<string[]>([]);
   
   // Sample data for charts
   const [chartData] = useState({
@@ -335,12 +401,81 @@ function App() {
     });
   };
 
+  const toggleSoftwareSelection = (id: string) => {
+    setSelectedSoftware(prev => 
+      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+    );
+  };
+
+  const installSelectedSoftware = async () => {
+    if (selectedSoftware.length === 0) return;
+    
+    const installCommands = selectedSoftware.map(id => {
+      const software = Object.values(CATALOG).find(s => s.id === id);
+      return software ? `install ${software.name}` : '';
+    }).filter(cmd => cmd).join(' and ');
+    
+    setInput(installCommands);
+    setSelectedSoftware([]);
+    setShowCatalog(false);
+    await send();
+  };
+
+  const getCatalogByCategory = () => {
+    const categories: Record<string, Array<{key: string, name: string, id: string}>> = {
+      'Development': [],
+      'Developer Utilities': [],
+      'Browsers': [],
+      'Design / Media': [],
+      'Networking / Remote': [],
+      'Productivity': [],
+      'Gaming': []
+    };
+
+    const usedKeys = new Set<string>();
+
+    for (const [key, value] of Object.entries(CATALOG)) {
+      if (usedKeys.has(key)) continue;
+      
+      if (['vscode', 'visual studio code', 'vs code', 'node lts', 'node.js lts', 'nodejs lts', 'node', 'nodejs', 'node.js', 'python 3.13', 'python 3.12', 'python', 'git', 'github desktop', 'visual studio 2022 community', 'visual studio 2022', 'java', 'java jdk', 'jdk', 'temurin', 'go lang', 'golang', 'go', 'rustup', 'rustlang', 'rust', 'docker', 'docker desktop', 'postman', 'dbeaver', 'mysql', 'postgresql', 'postgres'].includes(key)) {
+        categories['Development'].push({ key, name: value.name, id: value.id });
+        usedKeys.add(key);
+      } else if (['7zip', '7-zip', '7 zip', 'powershell 7', 'powershell', 'windows terminal', 'notepad++', 'notepad', 'everything', 'winmerge', 'jq', 'cmake', 'ninja', 'llvm'].includes(key)) {
+        categories['Developer Utilities'].push({ key, name: value.name, id: value.id });
+        usedKeys.add(key);
+      } else if (['chrome', 'google chrome', 'firefox', 'edge', 'microsoft edge', 'brave', 'opera', 'vivaldi'].includes(key)) {
+        categories['Browsers'].push({ key, name: value.name, id: value.id });
+        usedKeys.add(key);
+      } else if (['vlc', 'obs studio', 'obs', 'gimp', 'inkscape', 'blender', 'audacity', 'handbrake', 'krita'].includes(key)) {
+        categories['Design / Media'].push({ key, name: value.name, id: value.id });
+        usedKeys.add(key);
+      } else if (['wireshark', 'putty', 'winscp', 'tailscale', 'openvpn', 'rustdesk'].includes(key)) {
+        categories['Networking / Remote'].push({ key, name: value.name, id: value.id });
+        usedKeys.add(key);
+      } else if (['libreoffice', 'obsidian', 'notion', 'sharex', 'powertoys', 'power toys'].includes(key)) {
+        categories['Productivity'].push({ key, name: value.name, id: value.id });
+        usedKeys.add(key);
+      } else if (['steam', 'epic games launcher', 'epic games', 'epic', 'gog galaxy', 'gog', 'ubisoft connect', 'ubisoft', 'discord'].includes(key)) {
+        categories['Gaming'].push({ key, name: value.name, id: value.id });
+        usedKeys.add(key);
+      }
+    }
+
+    return categories;
+  };
+
   const run = async (id: string) => {
     const task = tasks.find(t => t.id === id);
     if (!task || task.status !== 'pending') return;
     setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'running' } : t));
     if (!window.electronAPI) {
-      setTasks(prev => prev.map(t => t.id === id ? { ...t, command: task.type === 'winget_install' ? `winget install --id ${task.params.id} --silent` : task.type } : t));
+      let command = task.type;
+      if (task.type === 'winget_install') {
+        command = `winget install --id ${task.params.id} --silent`;
+      } else if (task.type === 'run_python') {
+        command = `python ${task.params.script_path} ${(task.params.args || []).join(' ')}`;
+      }
+      setTasks(prev => prev.map(t => t.id === id ? { ...t, command } : t));
       setLogs(prev => [...prev, { id, line: `Simulated ${task.type}: ${JSON.stringify(task.params)}\n` }]);
       setTimeout(() => setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'done' } : t)), 800);
       return;
@@ -502,6 +637,18 @@ function App() {
           </div>
 
           <div className="sidebar-section">
+            <h3>Software Catalog</h3>
+            <button className="catalog-toggle-btn" onClick={() => setShowCatalog(!showCatalog)}>
+              {showCatalog ? 'Hide Catalog' : 'Show Catalog'}
+            </button>
+            <div className="selection-info">
+              {selectedSoftware.length > 0 && (
+                <p><strong>Selected:</strong> {selectedSoftware.length} item(s)</p>
+              )}
+            </div>
+          </div>
+
+          <div className="sidebar-section">
             <h3>Software Details</h3>
             <div className="software-info">
               <p><strong>Version:</strong> 2.0.0</p>
@@ -539,6 +686,45 @@ function App() {
               </button>
             </div>
           </div>
+
+          {/* Software Catalog Section */}
+          {showCatalog && (
+            <div className="software-catalog-section">
+              <div className="catalog-header">
+                <h2>Software Catalog</h2>
+                <p>Browse and select software to install multiple packages at once</p>
+                {selectedSoftware.length > 0 && (
+                  <button className="install-selected-btn" onClick={installSelectedSoftware}>
+                    Install Selected ({selectedSoftware.length})
+                  </button>
+                )}
+              </div>
+              <div className="catalog-content">
+                {Object.entries(getCatalogByCategory()).map(([category, items]) => (
+                  <div key={category} className="catalog-category">
+                    <h3>{category}</h3>
+                    <div className="catalog-items">
+                      {items.map((item) => (
+                        <div 
+                          key={`${item.key}-${item.id}`} 
+                          className={`catalog-item ${selectedSoftware.includes(item.id) ? 'selected' : ''}`}
+                          onClick={() => toggleSoftwareSelection(item.id)}
+                        >
+                          <div className="catalog-item-checkbox">
+                            {selectedSoftware.includes(item.id) && '✓'}
+                          </div>
+                          <div className="catalog-item-info">
+                            <div className="catalog-item-name">{item.name}</div>
+                            <div className="catalog-item-id">{item.id}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Charts Section */}
           <div className="charts-section">

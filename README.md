@@ -308,7 +308,7 @@ Supported winget catalog (real, verified package ids only — never guessed):
 | Notepad++          | `Notepad++.Notepad++`             |
 | Everything         | `voidtools.Everything`            |
 | WinMerge           | `WinMerge.WinMerge`               |
-| jq                  | `jqlang.jq`                       |
+| jq                 | `jqlang.jq`                       |
 | CMake              | `Kitware.CMake`                   |
 | Ninja              | `Ninja-build.Ninja`               |
 | LLVM               | `LLVM.LLVM`                       |

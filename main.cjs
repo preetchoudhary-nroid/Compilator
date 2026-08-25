@@ -7,7 +7,7 @@ const {
   extractInstallTarget,
   isNegated,
   resolveCatalogTarget,
-} = require('./src/planner-core.js');
+} = require('./src/planner-core.cjs');
 
 let mainWindow;
 
@@ -199,9 +199,9 @@ async function finishTaskRun(id, { status, exitCode, error }) {
 // specified by the Compilator planner rules. Does NOT execute anything — the
 // human-approved execution step runs the tasks afterwards.
 //
-// Allowed task types: mkdir, winget_install, winget_list, write_file.
+// Allowed task types: mkdir, winget_install, winget_list, write_file, run_python.
 // ---------------------------------------------------------------------------
-const ALLOWED_TYPES = ['mkdir', 'winget_install', 'winget_list', 'write_file'];
+const ALLOWED_TYPES = ['mkdir', 'winget_install', 'winget_list', 'write_file', 'run_python'];
 
 // Confident, real winget package ids only. Never guess. Verified against the
 // winget source; more-specific alias keys are listed before generic ones so a
@@ -312,6 +312,7 @@ const ESTIMATES = {
   winget_install: 180,
   winget_list: 15,
   write_file: 3,
+  run_python: 30,
 };
 
 // Parse "winget list" output: columns are Name / Id / Version / Available / Source.
@@ -370,6 +371,25 @@ function sanitizePath(rawPath) {
 // "chrome setup kar do"), and isNegated() blocks refusal/cancellation. We only
 // build tasks for packages verified in WINGET_CATALOG — never guessed ones.
 
+// Split a request into multiple sub-requests using common separators
+function splitMultiCommandRequest(text) {
+  const separators = [
+    /\s+and\s+/,
+    /\s+then\s+/,
+    /\s+,/,
+    /\s+;\s*/,
+    /\s+also\s+/,
+    /\s+plus\s+/,
+  ];
+  
+  let parts = [text];
+  for (const sep of separators) {
+    parts = parts.flatMap(part => part.split(sep).map(p => p.trim()).filter(p => p));
+  }
+  
+  return parts;
+}
+
 function planFromRequest(request, installed) {
   const text = (request || '').toLowerCase().trim();
   const tasks = [];
@@ -379,12 +399,33 @@ function planFromRequest(request, installed) {
     tasks_skipped.push({ request: reqText, reason });
   };
 
+  // Check if this is a multi-command request
+  const subRequests = splitMultiCommandRequest(text);
+  
+  if (subRequests.length > 1) {
+    // Process each sub-request individually
+    for (const subReq of subRequests) {
+      const subPlan = planSingleRequest(subReq, installed, pushSkip);
+      tasks.push(...subPlan.tasks);
+    }
+    return { tasks, tasks_skipped };
+  }
+
+  // Process as a single request
+  const singlePlan = planSingleRequest(text, installed, pushSkip);
+  tasks.push(...singlePlan.tasks);
+  return { tasks, tasks_skipped };
+}
+
+function planSingleRequest(text, installed, pushSkip) {
+  const tasks = [];
+  
   // ---- refusal / negation ------------------------------------------------
   // "i dont want to install X", "don't install chrome", "never mind",
   // "cancel the chrome installation" — never plan these.
   if (isNegated(text)) {
-    pushSkip(request || '(empty request)', 'You asked not to install it — no action was planned.');
-    return { tasks, tasks_skipped };
+    pushSkip(text || '(empty request)', 'You asked not to install it — no action was planned.');
+    return { tasks };
   }
 
   // ---- winget_list -------------------------------------------------------
@@ -396,7 +437,7 @@ function planFromRequest(request, installed) {
       estimated_seconds: ESTIMATES.winget_list,
       status: 'pending',
     });
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
 
   // ---- mkdir -------------------------------------------------------------
@@ -416,7 +457,7 @@ function planFromRequest(request, installed) {
     } catch (err) {
       pushSkip(text || '(empty request)', `Invalid folder path: ${err.message}`);
     }
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
 
   // ---- write_file --------------------------------------------------------
@@ -439,7 +480,7 @@ function planFromRequest(request, installed) {
     } catch (err) {
       pushSkip(text || '(empty request)', `Invalid file path: ${err.message}`);
     }
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
   const simpleWrite = text.match(/(?:write|create|save)\s+(?:a |the )?(?:file\s+)?["']?([^"']+)["']?\s*$/);
   if (simpleWrite && /write|create|save/.test(text)) {
@@ -457,7 +498,30 @@ function planFromRequest(request, installed) {
     } catch (err) {
       pushSkip(text || '(empty request)', `Invalid file path: ${err.message}`);
     }
-    return { tasks, tasks_skipped };
+    return { tasks };
+  }
+
+  // ---- run_python --------------------------------------------------------
+  const pythonMatch = text.match(/(?:run|execute)\s+(?:python\s+)?(?:script\s+)?(.+?)(?:\s+(?:with|using)\s+(.+))?$/);
+  if (pythonMatch) {
+    try {
+      const scriptPath = pythonMatch[1].trim();
+      const args = pythonMatch[2] ? pythonMatch[2].trim().split(/\s+/) : [];
+      
+      // Allow absolute paths for Python scripts (less restrictive than file operations)
+      if (scriptPath) {
+        tasks.push({
+          type: 'run_python',
+          label: `Run Python script ${scriptPath}`,
+          params: { script_path: scriptPath, args },
+          estimated_seconds: ESTIMATES.run_python,
+          status: 'pending',
+        });
+      }
+    } catch (err) {
+      pushSkip(text || '(empty request)', `Invalid Python script path: ${err.message}`);
+    }
+    return { tasks };
   }
 
   // ---- prepare AI development PC (curated plan) --------------------------
@@ -489,7 +553,7 @@ function planFromRequest(request, installed) {
       status: nodeInstalled ? 'already_installed' : 'pending',
       ...(nodeInstalled ? { note: `Already installed (version ${nodeInstalled.version})` } : {}),
     });
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
 
   // ---- winget_install ----------------------------------------------------
@@ -510,10 +574,10 @@ function planFromRequest(request, installed) {
         status: installedPkg ? 'already_installed' : 'pending',
         ...(installedPkg ? { note: `Already installed (version ${installedPkg.version})` } : {}),
       });
-      return { tasks, tasks_skipped };
+      return { tasks };
     }
     pushSkip(`install ${requested}`, 'Unknown or unverified winget package id — refusing to guess one.');
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
 
   // An install-ish request we could not pin down — explain what we support.
@@ -522,7 +586,7 @@ function planFromRequest(request, installed) {
       text || '(empty request)',
       'I could not figure out which package to install. I know 50+ verified winget packages (dev tools, browsers, media, networking, productivity, gaming) — try "install <software name>", e.g. "install github desktop".'
     );
-    return { tasks, tasks_skipped };
+    return { tasks };
   }
 
   // ---- no match ----------------------------------------------------------
@@ -530,7 +594,7 @@ function planFromRequest(request, installed) {
     text || '(empty request)',
     `Does not match any allowed task type (${ALLOWED_TYPES.join(', ')}).`
   );
-  return { tasks, tasks_skipped };
+  return { tasks };
 }
 
 function summarizePlan(plan) {
@@ -595,6 +659,19 @@ function normalizePlannerPlan(plan, installed) {
       if (!params.id || !validWingetIds.has(params.id.toLowerCase())) {
         tasks_skipped.push({ request: label, reason: 'Unknown or unverified winget package id — refusing to guess one.' });
         continue;
+      }
+    }
+    if (type === 'run_python') {
+      params.script_path = String(params.script_path || '');
+      if (!params.script_path) {
+        tasks_skipped.push({ request: label, reason: 'Missing script path.' });
+        continue;
+      }
+      // Allow args to be array or string
+      if (params.args && typeof params.args === 'string') {
+        params.args = params.args.split(/\s+/);
+      } else if (!Array.isArray(params.args)) {
+        params.args = [];
       }
     }
 
@@ -830,6 +907,51 @@ const TASK_RUNNERS = {
       safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
       finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
     }
+  },
+  'run_python': (task, wc) => {
+    const scriptPath = task.params.script_path;
+    const args = task.params.args || [];
+    const command = `python ${scriptPath} ${args.join(' ')}`;
+    const run = startTaskRun(task, wc, command);
+    
+    const proc = spawn('python', [scriptPath, ...args]);
+    runningProcesses.set(task.id, proc);
+
+    proc.stdout.on('data', (data) => {
+      run.stdout.push(data.toString());
+      safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
+    });
+    proc.stderr.on('data', (data) => {
+      run.stderr.push(data.toString());
+      safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
+    });
+    proc.on('error', (err) => {
+      runningProcesses.delete(task.id);
+      if (run.cancelled) {
+        run.error = err;
+        safeSend(wc, 'task:log', { id: task.id, line: `\n[cancelled] ${err.message}\n` });
+        safeSend(wc, 'task:update', { id: task.id, status: 'cancelled' });
+        finishTaskRun(task.id, { status: 'cancelled', exitCode: null, error: err });
+        return;
+      }
+      run.error = err;
+      safeSend(wc, 'task:log', { id: task.id, line: `[error] ${err.message}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
+      finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
+    });
+    proc.on('close', (code) => {
+      runningProcesses.delete(task.id);
+      if (run.cancelled) {
+        safeSend(wc, 'task:log', { id: task.id, line: `[python] exit code ${code} (cancelled)\n` });
+        safeSend(wc, 'task:update', { id: task.id, status: 'cancelled', exitCode: code });
+        finishTaskRun(task.id, { status: 'cancelled', exitCode: code, error: new Error('User cancelled') });
+        return;
+      }
+      safeSend(wc, 'task:log', { id: task.id, line: `[python] exit code ${code}\n` });
+      const status = code === 0 ? 'done' : 'failed';
+      safeSend(wc, 'task:update', { id: task.id, status, exitCode: code });
+      finishTaskRun(task.id, { status, exitCode: code, error: status === 'failed' ? new Error(`Process exited with code ${code}`) : null });
+    });
   },
 };
 

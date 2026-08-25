@@ -2,7 +2,6 @@
   "name": "compilator",
   "private": true,
   "version": "0.0.0",
-  "type": "module",
   "main": "main.cjs",
   "scripts": {
     "dev": "concurrently \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env NODE_ENV=development AI_PROVIDER=ollama AI_MODEL=gemma3:4b electron .\"",
