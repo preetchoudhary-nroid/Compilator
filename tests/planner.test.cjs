@@ -382,6 +382,57 @@ check('write file config.json with hello -> write_file', () => {
   assert.equal(p.tasks.length, 1);
   assert.equal(p.tasks[0].type, 'write_file');
 });
+// ---- list_exe_files security tests ---------------------------------------
+console.log('\n[list_exe_files] security validation');
+check('list C drive exe files -> valid task', () => {
+  const p = planFromRequest('list C drive exe files', []);
+  assert.equal(p.tasks.length, 1);
+  assert.equal(p.tasks[0].type, 'list_exe_files');
+  assert.equal(p.tasks[0].params.drive, 'C:');
+});
+check('list D drive exe files -> valid task', () => {
+  const p = planFromRequest('list D drive exe files', []);
+  assert.equal(p.tasks.length, 1);
+  assert.equal(p.tasks[0].type, 'list_exe_files');
+  assert.equal(p.tasks[0].params.drive, 'D:');
+});
+check('list E drive exe files -> valid task', () => {
+  const p = planFromRequest('list E drive exe files', []);
+  assert.equal(p.tasks.length, 1);
+  assert.equal(p.tasks[0].type, 'list_exe_files');
+  assert.equal(p.tasks[0].params.drive, 'E:');
+});
+check('malformed drive values -> skipped/rejected', () => {
+  const p = planFromRequest('list CC drive exe files', []);
+  if (p.tasks.length !== 0) console.log("FAILED TASK:", p.tasks);
+  assert.equal(p.tasks.length, 0);
+});
+check('C:\\\\something -> rejected', () => {
+  const p = planFromRequest('list C:\\\\something drive exe files', []);
+  if (p.tasks.length !== 0) console.log("FAILED TASK:", p.tasks);
+  assert.equal(p.tasks.length, 0);
+});
+check('C;... -> rejected', () => {
+  const p = planFromRequest('list C; drive exe files', []);
+  if (p.tasks.length !== 0) console.log("FAILED TASK:", p.tasks);
+  assert.equal(p.tasks.length, 0);
+});
+check('C | ... -> rejected', () => {
+  const p = planFromRequest('list C | drive exe files', []);
+  if (p.tasks.length !== 0) console.log("FAILED TASK:", p.tasks);
+  assert.equal(p.tasks.length, 0);
+});
+check('C && ... -> rejected', () => {
+  const p = planFromRequest('list C && drive exe files', []);
+  if (p.tasks.length !== 0) console.log("FAILED TASK:", p.tasks);
+  assert.equal(p.tasks.length, 0);
+});
+check('PowerShell injection attempts -> rejected', () => {
+  const p = planFromRequest('list C:; Invoke-WebRequest -Uri http://malicious.com drive exe files', []);
+  if (p.tasks.length !== 0) console.log("FAILED TASK:", p.tasks);
+  assert.equal(p.tasks.length, 0);
+});
+
 // ---- Shared parser core (used by BOTH main.cjs and the browser planner) ----
 console.log('\n[core] extractInstallTarget word-order + filler');
 [

@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import './App.css';
 import { extractInstallTarget, isNegated, resolveCatalogTarget } from './planner-core.js';
+import { InteractiveChart } from './components/InteractiveChart.js';
 
 declare global {
   interface Window {
     electronAPI?: {
-      executeTask: (p: { taskId: string; type: string; params: Record<string, string> }) => Promise<{ success: boolean; taskId: string; error?: string }>;
+      executeTask: (p: { taskId: string; type: string; params: Record<string, any> }) => Promise<{ success: boolean; taskId: string; error?: string }>;
       cancelTask: (taskId: string) => Promise<{ success: boolean; taskId: string; cancelled: boolean; reason?: string }>;
       chatWithAI: (prompt: string, requestId: string) => Promise<{ success: boolean; requestId: string; error?: string }>;
       wingetList: () => Promise<{ success: boolean; output?: string; error?: string }>;
@@ -20,42 +21,12 @@ declare global {
   }
 }
 
-// Simple chart component for data visualization
-const SimpleChart = ({ data, title }: { data: number[]; title: string }) => {
-  const max = Math.max(...data, 1);
-  const height = 60;
-  const width = 200;
-  
-  return (
-    <div className="chart-container">
-      <h4 className="chart-title">{title}</h4>
-      <svg width={width} height={height} className="chart-svg">
-        {data.map((value, index) => {
-          const barHeight = (value / max) * (height - 20);
-          const x = (index / data.length) * width;
-          const y = height - barHeight - 10;
-          return (
-            <rect
-              key={index}
-              x={x}
-              y={y}
-              width={(width / data.length) - 2}
-              height={barHeight}
-              fill="#ffffff"
-              opacity={0.7}
-              rx={2}
-            />
-          );
-        })}
-      </svg>
-    </div>
-  );
-};
+// Interactive chart component is imported from components/InteractiveChart.js
 
 type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'already_installed' | 'cancelled' | 'cancelling';
 
 interface PlannerTask {
-  type: 'mkdir' | 'winget_install' | 'winget_list' | 'write_file' | 'run_python';
+  type: 'mkdir' | 'winget_install' | 'winget_list' | 'write_file' | 'list_exe_files' | 'run_python';
   label: string;
   params: { path?: string; id?: string; content?: string; script_path?: string; args?: string[] };
   estimated_seconds: number;
@@ -343,7 +314,7 @@ function App() {
   const [sending, setSending] = useState(false);
   const [reports, setReports] = useState<Record<string, string>>({});
   const boxRef = useRef<HTMLDivElement>(null);
-  const [activeSection, setActiveSection] = useState('components');
+  const [activeSection, setActiveSection] = useState('tasks');
   const [showLogs, setShowLogs] = useState(false);
   const [showCatalog, setShowCatalog] = useState(false);
   const [selectedSoftware, setSelectedSoftware] = useState<string[]>([]);
@@ -469,7 +440,7 @@ function App() {
     if (!task || task.status !== 'pending') return;
     setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'running' } : t));
     if (!window.electronAPI) {
-      let command = task.type;
+      let command: string = task.type;
       if (task.type === 'winget_install') {
         command = `winget install --id ${task.params.id} --silent`;
       } else if (task.type === 'run_python') {
@@ -480,7 +451,7 @@ function App() {
       setTimeout(() => setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'done' } : t)), 800);
       return;
     }
-    const r = await window.electronAPI.executeTask({ taskId: id, type: task.type, params: { ...task.params } });
+    const r = await window.electronAPI.executeTask({ taskId: id, type: task.type, params: { ...task.params } as Record<string, any> });
     if (!r.success) {
       setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'failed' } : t));
       setLogs(prev => [...prev, { id, line: `[error] ${r.error}\n` }]);
@@ -560,12 +531,9 @@ function App() {
         <div className="header-left">
           <div className="logo">S</div>
           <nav className="header-nav">
-            <a href="#" className={activeSection === 'docs' ? 'active' : ''} onClick={() => setActiveSection('docs')}>Docs</a>
-            <a href="#" className={activeSection === 'components' ? 'active' : ''} onClick={() => setActiveSection('components')}>Components</a>
-            <a href="#" className={activeSection === 'blocks' ? 'active' : ''} onClick={() => setActiveSection('blocks')}>Blocks</a>
-            <a href="#" className={activeSection === 'showcase' ? 'active' : ''} onClick={() => setActiveSection('showcase')}>Showcase</a>
-            <a href="#" className={activeSection === 'charts' ? 'active' : ''} onClick={() => setActiveSection('charts')}>Charts</a>
-            <a href="#" className={activeSection === 'studio' ? 'active' : ''} onClick={() => setActiveSection('studio')}>Studio</a>
+            <a href="#" className={activeSection === 'tasks' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('tasks'); }}>Tasks</a>
+            <a href="#" className={activeSection === 'catalog' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('catalog'); }}>Catalog</a>
+            <a href="#" className={activeSection === 'settings' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('settings'); }}>Settings</a>
           </nav>
         </div>
         <div className="header-right">
@@ -586,14 +554,11 @@ function App() {
         {/* Left Sidebar */}
         <aside className="bklit-sidebar">
           <div className="sidebar-section">
-            <h3>Getting Started</h3>
+            <h3>Navigation</h3>
             <ul>
-              <li><a href="#" className={activeSection === 'docs' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('docs'); }}>Docs</a></li>
-              <li><a href="#" className={activeSection === 'components' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('components'); }}>Components</a></li>
-              <li><a href="#" className={activeSection === 'blocks' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('blocks'); }}>Blocks</a></li>
-              <li><a href="#" className={activeSection === 'showcase' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('showcase'); }}>Showcase</a></li>
-              <li><a href="#" className={activeSection === 'charts' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('charts'); }}>Charts</a></li>
-              <li><a href="#" className={activeSection === 'studio' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('studio'); }}>Studio</a></li>
+              <li><a href="#" className={activeSection === 'tasks' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('tasks'); }}>Tasks</a></li>
+              <li><a href="#" className={activeSection === 'catalog' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('catalog'); }}>Catalog</a></li>
+              <li><a href="#" className={activeSection === 'settings' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('settings'); }}>Settings</a></li>
             </ul>
           </div>
           
@@ -730,9 +695,9 @@ function App() {
           <div className="charts-section">
             <h2>Performance Charts</h2>
             <div className="charts-grid">
-              <SimpleChart data={chartData.taskCompletion} title="Task Completion Rate" />
-              <SimpleChart data={chartData.systemResources} title="System Resources" />
-              <SimpleChart data={chartData.installationTime} title="Installation Time (s)" />
+              <InteractiveChart data={chartData.taskCompletion} title="Task Completion Rate" />
+              <InteractiveChart data={chartData.systemResources} title="System Resources" />
+              <InteractiveChart data={chartData.installationTime} title="Installation Time (s)" />
             </div>
           </div>
 

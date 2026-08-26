@@ -199,9 +199,11 @@ async function finishTaskRun(id, { status, exitCode, error }) {
 // specified by the Compilator planner rules. Does NOT execute anything — the
 // human-approved execution step runs the tasks afterwards.
 //
-// Allowed task types: mkdir, winget_install, winget_list, write_file, run_python.
+// Allowed task types: mkdir, winget_install, winget_list, write_file, list_exe_files, run_python.
 // ---------------------------------------------------------------------------
-const ALLOWED_TYPES = ['mkdir', 'winget_install', 'winget_list', 'write_file', 'run_python'];
+const SUPPORTED_TASK_TYPES = ['mkdir', 'winget_install', 'winget_list', 'write_file', 'list_exe_files', 'run_python'];
+// Compatibility alias used throughout the codebase
+const ALLOWED_TYPES = SUPPORTED_TASK_TYPES;
 
 // Confident, real winget package ids only. Never guess. Verified against the
 // winget source; more-specific alias keys are listed before generic ones so a
@@ -312,6 +314,7 @@ const ESTIMATES = {
   winget_install: 180,
   winget_list: 15,
   write_file: 3,
+  list_exe_files: 15,
   run_python: 30,
 };
 
@@ -347,12 +350,12 @@ function cleanPath(raw) {
 // Security: Validate and sanitize file paths to prevent directory traversal attacks
 function sanitizePath(rawPath) {
   const cleaned = cleanPath(rawPath);
-  
+
   // Prevent directory traversal
   if (cleaned.includes('..') || cleaned.includes('~') || cleaned.startsWith('/')) {
     throw new Error('Invalid path: directory traversal and absolute paths are not allowed');
   }
-  
+
   // Prevent access to sensitive system directories
   const sensitiveDirs = ['windows', 'program files', 'system32', 'boot', 'etc'];
   const lowerPath = cleaned.toLowerCase();
@@ -361,7 +364,7 @@ function sanitizePath(rawPath) {
       throw new Error(`Invalid path: access to ${dir} is not allowed`);
     }
   }
-  
+
   return cleaned;
 }
 
@@ -381,12 +384,12 @@ function splitMultiCommandRequest(text) {
     /\s+also\s+/,
     /\s+plus\s+/,
   ];
-  
+
   let parts = [text];
   for (const sep of separators) {
     parts = parts.flatMap(part => part.split(sep).map(p => p.trim()).filter(p => p));
   }
-  
+
   return parts;
 }
 
@@ -401,7 +404,7 @@ function planFromRequest(request, installed) {
 
   // Check if this is a multi-command request
   const subRequests = splitMultiCommandRequest(text);
-  
+
   if (subRequests.length > 1) {
     // Process each sub-request individually
     for (const subReq of subRequests) {
@@ -419,12 +422,31 @@ function planFromRequest(request, installed) {
 
 function planSingleRequest(text, installed, pushSkip) {
   const tasks = [];
-  
+
   // ---- refusal / negation ------------------------------------------------
   // "i dont want to install X", "don't install chrome", "never mind",
   // "cancel the chrome installation" — never plan these.
   if (isNegated(text)) {
     pushSkip(text || '(empty request)', 'You asked not to install it — no action was planned.');
+    return { tasks };
+  }
+
+  // ---- list exe files ----------------------------------------------------------
+  const exeListMatch = text.match(/(?:list|put|show|output).*?(?:exe.*files\s*of\s*(\S+)\s*drive|(\S+)\s*drive\s*exe.*files)/i);
+  if (exeListMatch) {
+    let drive = (exeListMatch[1] || exeListMatch[2]).toUpperCase();
+    if (!drive.endsWith(':')) drive += ':';
+    if (!/^[A-Z]:$/.test(drive)) {
+      pushSkip(text || '(empty request)', 'Invalid drive letter. Must be a single letter like C: or D:');
+      return { tasks };
+    }
+    tasks.push({
+      type: 'list_exe_files',
+      label: `List .exe files on ${drive}`,
+      params: { drive },
+      estimated_seconds: (ESTIMATES && ESTIMATES.list_exe_files) || ESTIMATES.winget_list,
+      status: 'pending',
+    });
     return { tasks };
   }
 
@@ -482,6 +504,24 @@ function planSingleRequest(text, installed, pushSkip) {
     }
     return { tasks };
   }
+  // ---- make a file (no content) ------------------------------------------------
+  const makeFileMatch = text.match(/make a file (?:in|inside)\s+([\w\\/\\.-]+)/i);
+  if (makeFileMatch) {
+    try {
+      const folderPath = sanitizePath(makeFileMatch[1]);
+      const filePath = folderPath.replace(/\\\\+$/, '') + '/output.txt';
+      tasks.push({
+        type: 'write_file',
+        label: `Create file ${filePath}`,
+        params: { path: filePath, content: '' },
+        estimated_seconds: ESTIMATES.write_file,
+        status: 'pending',
+      });
+    } catch (err) {
+      pushSkip(text || '(empty request)', `Invalid folder path for make file: ${err.message}`);
+    }
+    return { tasks };
+  }
   const simpleWrite = text.match(/(?:write|create|save)\s+(?:a |the )?(?:file\s+)?["']?([^"']+)["']?\s*$/);
   if (simpleWrite && /write|create|save/.test(text)) {
     try {
@@ -507,7 +547,7 @@ function planSingleRequest(text, installed, pushSkip) {
     try {
       const scriptPath = pythonMatch[1].trim();
       const args = pythonMatch[2] ? pythonMatch[2].trim().split(/\s+/) : [];
-      
+
       // Allow absolute paths for Python scripts (less restrictive than file operations)
       if (scriptPath) {
         tasks.push({
@@ -672,6 +712,13 @@ function normalizePlannerPlan(plan, installed) {
         params.args = params.args.split(/\s+/);
       } else if (!Array.isArray(params.args)) {
         params.args = [];
+      }
+    }
+    if (type === 'list_exe_files') {
+      params.drive = String(params.drive || '').toUpperCase().trim();
+      if (!/^[A-Z]:$/.test(params.drive)) {
+        tasks_skipped.push({ request: label, reason: 'Invalid drive letter. Must be a single letter like C: or D:.' });
+        continue;
       }
     }
 
@@ -913,7 +960,7 @@ const TASK_RUNNERS = {
     const args = task.params.args || [];
     const command = `python ${scriptPath} ${args.join(' ')}`;
     const run = startTaskRun(task, wc, command);
-    
+
     const proc = spawn('python', [scriptPath, ...args]);
     runningProcesses.set(task.id, proc);
 
@@ -952,6 +999,67 @@ const TASK_RUNNERS = {
       safeSend(wc, 'task:update', { id: task.id, status, exitCode: code });
       finishTaskRun(task.id, { status, exitCode: code, error: status === 'failed' ? new Error(`Process exited with code ${code}`) : null });
     });
+  },
+  'list_exe_files': async (task, wc) => {
+    let drive = task.params.drive;
+    if (typeof drive !== 'string' || !/^[A-Z]:$/.test(drive.toUpperCase().trim())) {
+      safeSend(wc, 'task:log', { id: task.id, line: `[error] Invalid drive parameter\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
+      finishTaskRun(task.id, { status: 'failed', exitCode: null, error: new Error('Invalid drive parameter') });
+      return;
+    }
+    drive = drive.toUpperCase().trim();
+
+    const command = `list_exe_files ${drive}`;
+    const run = startTaskRun(task, wc, command);
+    try {
+      // Use a fixed script and pass the drive as a safe parameter
+      const script = `param([string]$TargetDrive); Get-ChildItem -Path "$TargetDrive\\" -Recurse -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName`;
+
+      const proc = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script, '-TargetDrive', drive]);
+      runningProcesses.set(task.id, proc);
+
+      proc.stdout.on('data', (data) => {
+        run.stdout.push(data.toString());
+        safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
+      });
+      proc.stderr.on('data', (data) => {
+        run.stderr.push(data.toString());
+        safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
+      });
+      proc.on('error', (err) => {
+        runningProcesses.delete(task.id);
+        run.error = err;
+        safeSend(wc, 'task:log', { id: task.id, line: `\n[error] ${err.message}\n` });
+        safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
+        finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
+      });
+      proc.on('close', (code) => {
+        runningProcesses.delete(task.id);
+        if (run.cancelled) {
+          safeSend(wc, 'task:log', { id: task.id, line: `\n[powershell] exit code ${code} (cancelled)\n` });
+          safeSend(wc, 'task:update', { id: task.id, status: 'cancelled', exitCode: code });
+          finishTaskRun(task.id, { status: 'cancelled', exitCode: code, error: new Error('User cancelled') });
+          return;
+        }
+
+        if (code === 0) {
+          safeSend(wc, 'task:log', { id: task.id, line: `\nFinished listing .exe files on ${drive}\n` });
+          safeSend(wc, 'task:update', { id: task.id, status: 'done', exitCode: code });
+          // Note: The task report containing stdout is automatically saved by finishTaskRun
+          finishTaskRun(task.id, { status: 'done', exitCode: code, error: null });
+        } else {
+          safeSend(wc, 'task:log', { id: task.id, line: `\n[powershell] exit code ${code}\n` });
+          safeSend(wc, 'task:update', { id: task.id, status: 'failed', exitCode: code });
+          finishTaskRun(task.id, { status: 'failed', exitCode: code, error: new Error(`Process exited with code ${code}`) });
+        }
+      });
+    } catch (err) {
+      run.error = err;
+      safeSend(wc, 'task:log', { id: task.id, line: `\n[error] ${err.message}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
+      finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
+    }
   },
 };
 
