@@ -17,6 +17,13 @@ declare global {
       onReportCreated: (cb: (d: { id: string; reportPath: string }) => void) => () => void;
       onChatChunk: (cb: (d: { requestId: string; chunk: string; full: string }) => void) => () => void;
       onChatDone: (cb: (d: { requestId: string; result: { success: boolean; intent: string; reply: string; tasks?: PlannerTask[]; tasks_skipped?: SkippedRequest[]; source?: string } }) => void) => () => void;
+      getConfig: () => Promise<any>;
+      saveConfig: (config: any) => Promise<{ success: boolean; error?: string }>;
+      minimize: () => void;
+      maximize: () => void;
+      close: () => void;
+      setSidebarMode: () => void;
+      setNormalMode: () => void;
     };
   }
 }
@@ -319,6 +326,29 @@ function App() {
   const [showCatalog, setShowCatalog] = useState(false);
   const [selectedSoftware, setSelectedSoftware] = useState<string[]>([]);
   
+  const [apiKey, setApiKey] = useState('');
+  const [aiProvider, setAiProvider] = useState('openai');
+  const [aiModel, setAiModel] = useState('');
+  const [configSaved, setConfigSaved] = useState(false);
+
+  useEffect(() => {
+    if (window.electronAPI?.getConfig) {
+      window.electronAPI.getConfig().then(cfg => {
+        if (cfg.apiKey) setApiKey(cfg.apiKey);
+        if (cfg.provider) setAiProvider(cfg.provider);
+        if (cfg.model) setAiModel(cfg.model);
+      });
+    }
+  }, []);
+
+  const saveSettings = async () => {
+    if (window.electronAPI?.saveConfig) {
+      await window.electronAPI.saveConfig({ apiKey, provider: aiProvider, model: aiModel });
+      setConfigSaved(true);
+      setTimeout(() => setConfigSaved(false), 2000);
+    }
+  };
+  
   // Sample data for charts
   const [chartData] = useState({
     taskCompletion: [65, 78, 90, 85, 92, 88, 95],
@@ -527,8 +557,8 @@ function App() {
   return (
     <div className="bklit-container">
       {/* Header */}
-      <header className="bklit-header">
-        <div className="header-left">
+      <header className="bklit-header" style={{ WebkitAppRegion: 'drag' } as any}>
+        <div className="header-left" style={{ WebkitAppRegion: 'no-drag' } as any}>
           <div className="logo">S</div>
           <nav className="header-nav">
             <a href="#" className={activeSection === 'tasks' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('tasks'); }}>Tasks</a>
@@ -536,16 +566,27 @@ function App() {
             <a href="#" className={activeSection === 'settings' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('settings'); }}>Settings</a>
           </nav>
         </div>
-        <div className="header-right">
-          <div className="search-box">
-            <span>🔍</span>
-            <span>Ctrl K</span>
+        <div className="header-right" style={{ WebkitAppRegion: 'no-drag' } as any}>
+          <button 
+            className="bklit-button" 
+            style={{ padding: '4px 8px', fontSize: '12px', marginRight: '10px' }}
+            onClick={() => window.electronAPI?.setSidebarMode()}
+          >
+            Sidebar Mode
+          </button>
+          <button 
+            className="bklit-button" 
+            style={{ padding: '4px 8px', fontSize: '12px', marginRight: '10px' }}
+            onClick={() => window.electronAPI?.setNormalMode()}
+          >
+            Normal Mode
+          </button>
+          
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <button onClick={() => window.electronAPI?.minimize()} style={{ background: 'transparent', border: 'none', color: 'var(--bklit-text)', cursor: 'pointer', fontSize: '16px' }}>─</button>
+            <button onClick={() => window.electronAPI?.maximize()} style={{ background: 'transparent', border: 'none', color: 'var(--bklit-text)', cursor: 'pointer', fontSize: '16px' }}>□</button>
+            <button onClick={() => window.electronAPI?.close()} style={{ background: 'transparent', border: 'none', color: 'var(--bklit-text)', cursor: 'pointer', fontSize: '16px' }}>✕</button>
           </div>
-          <div className="github-stars">
-            <span>⭐</span>
-            <span>1518</span>
-          </div>
-          <div className="theme-toggle">🌙</div>
         </div>
       </header>
 
@@ -630,6 +671,56 @@ function App() {
             <h1>Components</h1>
             <p>A collection of chart components for your applications.</p>
           </div>
+
+          {/* Settings Section */}
+          {activeSection === 'settings' && (
+            <div className="settings-section" style={{ padding: '20px', background: 'var(--bklit-panel)', borderRadius: '12px', marginBottom: '20px' }}>
+              <h2>AI Provider Settings</h2>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '15px', marginTop: '15px' }}>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '5px' }}>Provider</label>
+                  <select 
+                    value={aiProvider} 
+                    onChange={e => setAiProvider(e.target.value)}
+                    style={{ width: '100%', padding: '10px', borderRadius: '6px', background: 'var(--bklit-bg)', color: 'var(--bklit-text)', border: '1px solid var(--bklit-border)' }}
+                  >
+                    <option value="openai">OpenAI</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="gemini">Gemini API</option>
+                    <option value="ollama">Ollama (Local)</option>
+                    <option value="lmstudio">LM Studio (Local)</option>
+                  </select>
+                </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '5px' }}>Model</label>
+                  <input 
+                    type="text" 
+                    value={aiModel} 
+                    onChange={e => setAiModel(e.target.value)}
+                    placeholder="gemini-2.5-pro (or leave blank for default)" 
+                    style={{ width: '100%', padding: '10px', borderRadius: '6px', background: 'var(--bklit-bg)', color: 'var(--bklit-text)', border: '1px solid var(--bklit-border)' }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '5px' }}>API Key</label>
+                  <input 
+                    type="password" 
+                    value={apiKey} 
+                    onChange={e => setApiKey(e.target.value)}
+                    placeholder="sk-..." 
+                    style={{ width: '100%', padding: '10px', borderRadius: '6px', background: 'var(--bklit-bg)', color: 'var(--bklit-text)', border: '1px solid var(--bklit-border)' }}
+                  />
+                </div>
+                <button 
+                  onClick={saveSettings} 
+                  className="bklit-button"
+                  style={{ alignSelf: 'flex-start', padding: '10px 20px' }}
+                >
+                  {configSaved ? 'Saved!' : 'Save Settings'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* AI Chat Section */}
           <div className="ai-chat-section">
