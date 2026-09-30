@@ -25,6 +25,7 @@ const PROVIDER_LABELS = {
   lmstudio: 'LM Studio',
   openai: 'OpenAI',
   openrouter: 'OpenRouter',
+  gemini: 'Gemini',
   custom: 'Custom',
 };
 
