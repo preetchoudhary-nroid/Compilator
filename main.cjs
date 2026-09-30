@@ -1065,9 +1065,11 @@ const TASK_RUNNERS = {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
+    fullscreen: true,
+    frame: false,
     width: 1280,
     height: 840,
-    minWidth: 960,
+    minWidth: 400,
     minHeight: 640,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -1096,6 +1098,35 @@ function createWindow() {
     mainWindow = null;
   });
 }
+
+ipcMain.on('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
+ipcMain.on('window:maximize', () => { 
+  if (mainWindow) {
+    if (mainWindow.isFullScreen()) mainWindow.setFullScreen(false);
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    else mainWindow.maximize();
+  }
+});
+ipcMain.on('window:close', () => { if (mainWindow) mainWindow.close(); });
+ipcMain.on('window:sidebar-mode', () => {
+  if (mainWindow) {
+    mainWindow.setFullScreen(false);
+    mainWindow.unmaximize();
+    mainWindow.setAlwaysOnTop(true, 'floating');
+    const { screen } = require('electron');
+    const primaryDisplay = screen.getPrimaryDisplay();
+    const { width, height } = primaryDisplay.workAreaSize;
+    // Set to right side sidebar
+    mainWindow.setBounds({ x: width - 400, y: 0, width: 400, height: height });
+  }
+});
+ipcMain.on('window:normal-mode', () => {
+  if (mainWindow) {
+    mainWindow.setAlwaysOnTop(false);
+    mainWindow.setBounds({ width: 1280, height: 840 });
+    mainWindow.center();
+  }
+});
 
 app.whenReady().then(() => {
   ensureAIDirs();
@@ -1294,6 +1325,37 @@ ipcMain.handle('chat-with-ai', async (event, { prompt, requestId }) => {
 
     if (!wc.isDestroyed()) wc.send('chat:done', { requestId: reqId, result });
     return { success: true, requestId: reqId };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// IPC: manage AI config.
+// ---------------------------------------------------------------------------
+ipcMain.handle('get-config', async () => {
+  try {
+    const file = path.join(app.getPath('userData'), 'ai-config.json');
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    }
+  } catch (e) {
+    console.error('Failed to read config', e);
+  }
+  return {};
+});
+
+ipcMain.handle('save-config', async (event, config) => {
+  try {
+    const file = path.join(app.getPath('userData'), 'ai-config.json');
+    let current = {};
+    if (fs.existsSync(file)) {
+      current = JSON.parse(fs.readFileSync(file, 'utf8'));
+    }
+    const merged = { ...current, ...config };
+    fs.writeFileSync(file, JSON.stringify(merged, null, 2), 'utf8');
+    return { success: true };
+  } catch (e) {
+    console.error('Failed to save config', e);
+    return { success: false, error: e.message };
   }
 });
 
