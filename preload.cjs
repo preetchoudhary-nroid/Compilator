@@ -13,6 +13,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wingetList: () => ipcRenderer.invoke('winget-list'),
   openReport: (reportPath) => ipcRenderer.invoke('open-report', reportPath),
   openReportFolder: (reportPath) => ipcRenderer.invoke('open-report-folder', reportPath),
+  saveConfig: (config) => ipcRenderer.invoke('save-config', config),
+  getConfig: () => ipcRenderer.invoke('get-config'),
+  
+  // Window controls
+  minimize: () => ipcRenderer.send('window:minimize'),
+  maximize: () => ipcRenderer.send('window:maximize'),
+  close: () => ipcRenderer.send('window:close'),
+  setSidebarMode: () => ipcRenderer.send('window:sidebar-mode'),
+  setNormalMode: () => ipcRenderer.send('window:normal-mode'),
 
   onTaskUpdate: (callback) => {
     const listener = (_event, data) => callback(data);
