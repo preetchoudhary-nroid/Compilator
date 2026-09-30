@@ -26,6 +26,7 @@ const PROVIDER_DEFAULTS = {
   lmstudio:  { serverUrl: 'http://127.0.0.1:1234/v1/chat/completions' },
   openai:    { serverUrl: 'https://api.openai.com/v1/chat/completions' },
   openrouter: { serverUrl: 'https://openrouter.ai/api/v1/chat/completions' },
+  gemini:    { serverUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions' },
   custom:    { serverUrl: 'http://127.0.0.1:8080/v1/chat/completions' },
 };
 
