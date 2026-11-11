@@ -20,14 +20,14 @@
 const fs = require('fs');
 const path = require('path');
 
-/** Default endpoint per provider. `custom` keeps the legacy default. */
+/** Default endpoint per provider. */
 const PROVIDER_DEFAULTS = {
-  ollama:    { serverUrl: 'http://127.0.0.1:11434/v1/chat/completions' },
-  lmstudio:  { serverUrl: 'http://127.0.0.1:1234/v1/chat/completions' },
+  groq:      { serverUrl: 'https://api.groq.com/openai/v1/chat/completions' },
   openai:    { serverUrl: 'https://api.openai.com/v1/chat/completions' },
-  openrouter: { serverUrl: 'https://openrouter.ai/api/v1/chat/completions' },
-  gemini:    { serverUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions' },
-  custom:    { serverUrl: 'http://127.0.0.1:8080/v1/chat/completions' },
+  ollama:    { serverUrl: 'http://localhost:11434/v1/chat/completions' },
+  lmstudio:  { serverUrl: 'http://localhost:1234/v1/chat/completions' },
+  openrouter:{ serverUrl: 'https://openrouter.ai/api/v1/chat/completions' },
+  custom:    { serverUrl: 'http://localhost:8080/v1/chat/completions' },
 };
 
 /** Read the JSON config file from Electron's userData dir (best effort). */
@@ -69,19 +69,20 @@ function isLocalHost(urlString) {
  */
 function loadAIConfig({ app } = {}) {
   const file = readUserConfig(app);
-  const provider = String(process.env.AI_PROVIDER || file.provider || 'ollama').toLowerCase();
-  const defaults = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.custom;
+  const provider = String(process.env.AI_PROVIDER || file.provider || 'groq').toLowerCase();
+  const defaults = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.groq;
 
   const serverUrl = String(process.env.AI_SERVER_URL || file.serverUrl || defaults.serverUrl);
   const model = String(
     process.env.AI_MODEL ||
     file.model ||
-    (provider === 'ollama' ? 'gemma3:4b' : 'gemma-3-4b')
+    'openai/gpt-oss-120b'
   );
   const temperature = Number(process.env.AI_TEMPERATURE ?? file.temperature ?? 0.7);
   const contextLength = Number(process.env.AI_CONTEXT_LENGTH ?? file.contextLength ?? 4096);
   const rawStream = process.env.AI_STREAMING ?? (file.streaming === undefined ? 'true' : String(file.streaming));
   const streaming = rawStream === 'true' || rawStream === true;
+  const apiKey = process.env.AI_API_KEY || process.env.GROQ_API_KEY || file.apiKey || '';
 
   return {
     provider,
@@ -90,6 +91,7 @@ function loadAIConfig({ app } = {}) {
     temperature,
     contextLength,
     streaming,
+    apiKey,
     executionMode: isLocalHost(serverUrl) ? 'local' : 'cloud',
   };
 }

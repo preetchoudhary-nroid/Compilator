@@ -2,6 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import './App.css';
 import { extractInstallTarget, isNegated, resolveCatalogTarget } from './planner-core.js';
 import { InteractiveChart } from './components/InteractiveChart.js';
+import FloatingTerminal from './components/FloatingTerminal.js';
+import type { TerminalBounds } from './components/FloatingTerminal.js';
+import TaskHistory from './components/TaskHistory.js';
+import CodeEditor from './components/CodeEditor.js';
+import TerminalPanel from './components/TerminalPanel.js';
 
 declare global {
   interface Window {
@@ -19,6 +24,9 @@ declare global {
       onChatDone: (cb: (d: { requestId: string; result: { success: boolean; intent: string; reply: string; tasks?: PlannerTask[]; tasks_skipped?: SkippedRequest[]; source?: string } }) => void) => () => void;
       getConfig: () => Promise<any>;
       saveConfig: (config: any) => Promise<{ success: boolean; error?: string }>;
+      getTaskHistory: (filters?: { limit?: number; type?: string; status?: string; search?: string }) => Promise<{ success: boolean; tasks: any[]; error?: string }>;
+      getTaskStats: () => Promise<{ success: boolean; stats: any; error?: string }>;
+      clearTaskHistory: () => Promise<{ success: boolean; error?: string }>;
       minimize: () => void;
       maximize: () => void;
       close: () => void;
@@ -33,7 +41,7 @@ declare global {
 type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'already_installed' | 'cancelled' | 'cancelling';
 
 interface PlannerTask {
-  type: 'mkdir' | 'winget_install' | 'winget_list' | 'write_file' | 'list_exe_files' | 'run_python';
+  type: 'mkdir' | 'winget_install' | 'winget_list' | 'write_file' | 'list_exe_files' | 'run_python' | 'run_powershell';
   label: string;
   params: { path?: string; id?: string; content?: string; script_path?: string; args?: string[] };
   estimated_seconds: number;
@@ -294,25 +302,53 @@ function planSingleRequestBrowser(text: string, skip: (r: string, reason: string
     return { tasks };
   }
 
-  skip(text || '(empty request)', 'Does not match any allowed task type (mkdir, winget_install, winget_list, write_file, run_python).');
+  // ---- run_powershell ----------------------------------------------------
+  const psMatch = text.match(/(?:run|execute)\s+(?:powershell\s+)?(?:script\s+)?(.+?\.ps1)(?:\s+(?:with|using)\s+(.+))?$/);
+  if (psMatch) {
+    try {
+      const scriptPath = psMatch[1].trim();
+      const args = psMatch[2] ? psMatch[2].trim().split(/\s+/) : [];
+      if (scriptPath) {
+        tasks.push({
+          type: 'run_powershell',
+          label: `Run PowerShell script ${scriptPath}`,
+          params: { script_path: scriptPath, args },
+          estimated_seconds: 30,
+          status: 'pending',
+        });
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      skip(text, `Invalid PowerShell script path: ${errorMessage}`);
+    }
+    return { tasks };
+  }
+
+  skip(text || '(empty request)', 'Does not match any allowed task type (mkdir, winget_install, winget_list, write_file, run_python, run_powershell).');
   return { tasks };
 }
 
-function badge(status: TaskStatus): string {
-  return {
-    running: 'Running...',
-    done: 'Completed',
-    failed: 'Failed',
-    pending: 'Pending',
-    already_installed: 'Already Installed',
-    cancelled: 'Cancelled',
-    cancelling: 'Cancelling...',
-  }[status];
+// unused helper kept for reference or removed
+// function badge(status: TaskStatus)... removed since unused
+
+const AI_PROVIDERS = [
+  { value: 'groq', label: 'Groq' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'ollama', label: 'Ollama' },
+  { value: 'lmstudio', label: 'LM Studio' },
+  { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'custom', label: 'Custom' },
+];
+
+interface TerminalWindowState {
+  bounds: TerminalBounds;
+  minimized: boolean;
+  zIndex: number;
 }
 
 function App() {
   const [tasks, setTasks] = useState<UiTask[]>([]);
-  const [skipped, setSkipped] = useState<SkippedRequest[]>([]);
+  const [, setSkipped] = useState<SkippedRequest[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [messages, setMessages] = useState<Message[]>([
     { role: 'ai', text: "Hello! I'm the Compilator task planner. Try: 'prepare my AI development pc', 'install git', 'create folder C:/AI', 'write file config.json with hello', 'run python script.py', or 'list installed packages'." },
@@ -322,14 +358,25 @@ function App() {
   const [reports, setReports] = useState<Record<string, string>>({});
   const boxRef = useRef<HTMLDivElement>(null);
   const [activeSection, setActiveSection] = useState('tasks');
-  const [showLogs, setShowLogs] = useState(false);
-  const [showCatalog, setShowCatalog] = useState(false);
   const [selectedSoftware, setSelectedSoftware] = useState<string[]>([]);
+  const [userName] = useState('Preet');
   
   const [apiKey, setApiKey] = useState('');
-  const [aiProvider, setAiProvider] = useState('openai');
+  const [aiProvider, setAiProvider] = useState('groq');
   const [aiModel, setAiModel] = useState('');
   const [configSaved, setConfigSaved] = useState(false);
+
+  // Persistent stats from task history store
+  const [historyStats, setHistoryStats] = useState<{
+    totalTasks: number; completed: number; failed: number; cancelled: number;
+    todayTasks: number; todayCompleted: number; avgDuration: number;
+    tasksByType: Record<string, number>;
+    tasksByDay: Array<{ date: string; count: number }>;
+  } | null>(null);
+
+  // FloatingTerminal window state
+  const [terminalWindows, setTerminalWindows] = useState<Record<string, TerminalWindowState>>({});
+  const terminalZRef = useRef(100);
 
   useEffect(() => {
     if (window.electronAPI?.getConfig) {
@@ -337,6 +384,12 @@ function App() {
         if (cfg.apiKey) setApiKey(cfg.apiKey);
         if (cfg.provider) setAiProvider(cfg.provider);
         if (cfg.model) setAiModel(cfg.model);
+      });
+    }
+    // Load persistent stats on mount
+    if (window.electronAPI?.getTaskStats) {
+      window.electronAPI.getTaskStats().then(res => {
+        if (res.success && res.stats) setHistoryStats(res.stats);
       });
     }
   }, []);
@@ -349,15 +402,44 @@ function App() {
     }
   };
   
-  // Sample data for charts
-  const [chartData] = useState({
-    taskCompletion: [65, 78, 90, 85, 92, 88, 95],
-    systemResources: [45, 52, 48, 60, 55, 62, 58],
-    installationTime: [120, 95, 80, 75, 70, 65, 60],
-  });
+  // Computed chart data from real tasks
+  const taskStatusData = (() => {
+    const statuses: { key: TaskStatus; label: string }[] = [
+      { key: 'done', label: 'Done' },
+      { key: 'running', label: 'Running' },
+      { key: 'pending', label: 'Pending' },
+      { key: 'failed', label: 'Failed' },
+      { key: 'cancelled', label: 'Cancelled' },
+      { key: 'already_installed', label: 'Pre-installed' },
+    ];
+    return {
+      values: statuses.map(s => tasks.filter(t => t.status === s.key).length),
+      labels: statuses.map(s => s.label),
+    };
+  })();
+  const taskTypeData = (() => {
+    const types: { key: PlannerTask['type']; label: string }[] = [
+      { key: 'winget_install', label: 'Install' },
+      { key: 'mkdir', label: 'Mkdir' },
+      { key: 'write_file', label: 'Write File' },
+      { key: 'winget_list', label: 'List Pkgs' },
+      { key: 'run_python', label: 'Python' },
+      { key: 'list_exe_files', label: 'List EXE' },
+    ];
+    return {
+      values: types.map(tp => tasks.filter(t => t.type === tp.key).length),
+      labels: types.map(tp => tp.label),
+    };
+  })();
 
   useEffect(() => window.electronAPI?.onTaskUpdate(({ id, status, command }) => {
     setTasks(prev => prev.map(t => t.id === id ? { ...t, status: status as TaskStatus, ...(command ? { command } : {}) } : t));
+    // Refresh persistent stats when a task finishes
+    if (['done', 'failed', 'cancelled', 'already_installed'].includes(status)) {
+      window.electronAPI?.getTaskStats?.().then(res => {
+        if (res?.success && res.stats) setHistoryStats(res.stats);
+      });
+    }
   }), []);
   useEffect(() => window.electronAPI?.onTaskLog(({ id, line }) => {
     setLogs(prev => [...prev, { id, line }]);
@@ -394,6 +476,74 @@ function App() {
 
   useEffect(() => { if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight; }, [messages, logs]);
 
+  // Listen for terminal commands and route them through the AI chat
+  const sendRef = useRef<(cmd: string) => void>(() => {});
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const cmd = (e as CustomEvent).detail;
+      if (cmd) sendRef.current(cmd);
+    };
+    window.addEventListener('terminal-command', handler);
+    return () => window.removeEventListener('terminal-command', handler);
+  }, []);
+
+  // Global keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key) {
+          case 't': e.preventDefault(); setActiveSection('terminal'); break;
+          case 'e': e.preventDefault(); setActiveSection('editor'); break;
+          case 'h': e.preventDefault(); setActiveSection('home'); break;
+          case 'j': e.preventDefault(); setActiveSection('tasks'); break;
+          case 'k': e.preventDefault(); setActiveSection('catalog'); break;
+        }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  // Auto-open a floating terminal when a task transitions to 'running'
+  useEffect(() => {
+    setTerminalWindows(prev => {
+      let updated = false;
+      const next = { ...prev };
+      tasks.forEach(t => {
+        if (t.status === 'running' && !next[t.id]) {
+          const count = Object.keys(next).length;
+          const offset = count * 30;
+          terminalZRef.current += 1;
+          next[t.id] = {
+            bounds: { x: 120 + offset, y: 80 + offset, width: 620, height: 360 },
+            minimized: false,
+            zIndex: terminalZRef.current,
+          };
+          updated = true;
+        }
+      });
+      return updated ? next : prev;
+    });
+  }, [tasks]);
+
+  const focusTerminal = (id: string) => {
+    terminalZRef.current += 1;
+    const z = terminalZRef.current;
+    setTerminalWindows(prev => prev[id] ? { ...prev, [id]: { ...prev[id], zIndex: z } } : prev);
+  };
+  const closeTerminal = (id: string) => {
+    setTerminalWindows(prev => {
+      const { [id]: _, ...rest } = prev;
+      return rest;
+    });
+  };
+  const toggleMinimizeTerminal = (id: string) => {
+    setTerminalWindows(prev => prev[id] ? { ...prev, [id]: { ...prev[id], minimized: !prev[id].minimized } } : prev);
+  };
+  const updateTerminalBounds = (id: string, bounds: TerminalBounds) => {
+    setTerminalWindows(prev => prev[id] ? { ...prev, [id]: { ...prev[id], bounds } } : prev);
+  };
+
   const integrate = (plan: PlannerTask[]) => {
     setTasks(prev => {
       const map = new Map(prev.map(t => [t.id, t]));
@@ -416,10 +566,9 @@ function App() {
       return software ? `install ${software.name}` : '';
     }).filter(cmd => cmd).join(' and ');
     
-    setInput(installCommands);
+    setInput('');
     setSelectedSoftware([]);
-    setShowCatalog(false);
-    await send();
+    await send(installCommands);
   };
 
   const getCatalogByCategory = () => {
@@ -505,6 +654,53 @@ function App() {
     }
   };
 
+  // Retry a failed task: create a new copy with 'pending' status
+  const retry = (id: string) => {
+    const task = tasks.find(t => t.id === id);
+    if (!task || (task.status !== 'failed' && task.status !== 'cancelled')) return;
+    const newId = `${task.type}-${Date.now()}-retry`;
+    setTasks(prev => [
+      ...prev.map(t => t.id === id ? { ...t, status: 'done' as TaskStatus } : t), // mark old as acknowledged
+      { ...task, id: newId, status: 'pending' as TaskStatus, command: undefined },
+    ]);
+  };
+
+  // Handle drag-and-drop of script files (.py, .ps1, .bat)
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    const scriptTasks: PlannerTask[] = [];
+    for (const file of files) {
+      const filePath = (file as any).path || file.name;
+      if (filePath.endsWith('.py')) {
+        scriptTasks.push({
+          type: 'run_python',
+          label: `Run Python script ${filePath}`,
+          params: { script_path: filePath, args: [] },
+          estimated_seconds: 30,
+          status: 'pending',
+        });
+      } else if (filePath.endsWith('.ps1')) {
+        scriptTasks.push({
+          type: 'run_powershell',
+          label: `Run PowerShell script ${filePath}`,
+          params: { script_path: filePath, args: [] },
+          estimated_seconds: 30,
+          status: 'pending',
+        });
+      }
+    }
+    if (scriptTasks.length > 0) {
+      integrate(scriptTasks);
+      setActiveSection('tasks');
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+
 
   const openReport = async (id: string) => {
     const reportPath = reports[id];
@@ -517,15 +713,15 @@ function App() {
 
 
 
-  const send = async () => {
-    const text = input.trim();
+  const send = async (overrideText?: string | any) => {
+    const text = (typeof overrideText === 'string' ? overrideText : input).trim();
     if (!text || sending) return;
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     setMessages(m => [...m, { role: 'user', text }, { role: 'ai', text: '', requestId }]);
     setInput('');
     setSending(true);
     try {
-      if (window.electronAPI?.chatWithAI) {
+          if (window.electronAPI?.chatWithAI) {
         // Streaming: the invoke returns immediately; the provider result —
         // including the final reply and any planned tasks — arrives via the
         // chat:chunk / chat:done events handled in the effect above.
@@ -553,226 +749,284 @@ function App() {
       setSending(false);
     }
   };
+  sendRef.current = send;
 
   return (
-    <div className="bklit-container">
-      {/* Header */}
-      <header className="bklit-header" style={{ WebkitAppRegion: 'drag' } as any}>
-        <div className="header-left" style={{ WebkitAppRegion: 'no-drag' } as any}>
-          <div className="logo">S</div>
-          <nav className="header-nav">
-            <a href="#" className={activeSection === 'tasks' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('tasks'); }}>Tasks</a>
-            <a href="#" className={activeSection === 'catalog' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('catalog'); }}>Catalog</a>
-            <a href="#" className={activeSection === 'settings' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('settings'); }}>Settings</a>
-          </nav>
+    <div className="app-layout" onDrop={handleDrop} onDragOver={handleDragOver}>
+      {/* Sidebar */}
+      <aside className="app-sidebar">
+        <div className="sidebar-logo">
+          <div className="logo-icon">&lt;/&gt;</div>
+          <span className="logo-text">Compilator</span>
         </div>
-        <div className="header-right" style={{ WebkitAppRegion: 'no-drag' } as any}>
-          <button 
-            className="bklit-button" 
-            style={{ padding: '4px 8px', fontSize: '12px', marginRight: '10px' }}
-            onClick={() => window.electronAPI?.setSidebarMode()}
-          >
-            Sidebar Mode
-          </button>
-          <button 
-            className="bklit-button" 
-            style={{ padding: '4px 8px', fontSize: '12px', marginRight: '10px' }}
-            onClick={() => window.electronAPI?.setNormalMode()}
-          >
-            Normal Mode
-          </button>
-          
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-            <button onClick={() => window.electronAPI?.minimize()} style={{ background: 'transparent', border: 'none', color: 'var(--bklit-text)', cursor: 'pointer', fontSize: '16px' }}>─</button>
-            <button onClick={() => window.electronAPI?.maximize()} style={{ background: 'transparent', border: 'none', color: 'var(--bklit-text)', cursor: 'pointer', fontSize: '16px' }}>□</button>
-            <button onClick={() => window.electronAPI?.close()} style={{ background: 'transparent', border: 'none', color: 'var(--bklit-text)', cursor: 'pointer', fontSize: '16px' }}>✕</button>
-          </div>
-        </div>
-      </header>
+        
+        <nav className="sidebar-nav">
+          <a href="#" className={activeSection === 'home' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('home'); }}>
+            <span className="icon">[H]</span> Home
+          </a>
+          <a href="#" className={activeSection === 'tasks' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('tasks'); }}>
+            <span className="icon">[T]</span> Tasks
+          </a>
+          <a href="#" className={activeSection === 'catalog' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('catalog'); }}>
+            <span className="icon">[C]</span> Catalog
+          </a>
+          <a href="#" className={activeSection === 'ai_chat' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('ai_chat'); }}>
+            <span className="icon">[A]</span> AI Chat
+          </a>
+          <a href="#" className={activeSection === 'editor' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('editor'); }}>
+            <span className="icon">[E]</span> Code Editor
+          </a>
+          <a href="#" className={activeSection === 'terminal' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('terminal'); }}>
+            <span className="icon">[&gt;]</span> Terminal
+          </a>
+          <a href="#" className={activeSection === 'settings' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('settings'); }}>
+            <span className="icon">[S]</span> Settings
+          </a>
+          <a href="#" className={activeSection === 'history' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('history'); }}>
+            <span className="icon">[⏱]</span> History
+          </a>
+        </nav>
 
-      {/* Main Content */}
-      <div className="bklit-main">
-        {/* Left Sidebar */}
-        <aside className="bklit-sidebar">
-          <div className="sidebar-section">
-            <h3>Navigation</h3>
-            <ul>
-              <li><a href="#" className={activeSection === 'tasks' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('tasks'); }}>Tasks</a></li>
-              <li><a href="#" className={activeSection === 'catalog' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('catalog'); }}>Catalog</a></li>
-              <li><a href="#" className={activeSection === 'settings' ? 'active' : ''} onClick={(e) => { e.preventDefault(); setActiveSection('settings'); }}>Settings</a></li>
-            </ul>
+        <div className="sidebar-bottom">
+          <div className="stay-focused-widget">
+            <h4>Stay focused</h4>
+            <p>Build your goals</p>
+            <div className="progress-bar-container">
+              <div className="progress-bar" style={{ width: `${tasks.length > 0 ? Math.round((tasks.filter(t => t.status === 'done' || t.status === 'already_installed').length / tasks.length) * 100) : 0}%` }}></div>
+            </div>
+            <div className="progress-text">{tasks.filter(t => t.status === 'done' || t.status === 'already_installed').length}/{tasks.length} tasks today</div>
           </div>
           
-          <div className="sidebar-section">
-            <h3>Compilator Tasks</h3>
-            <ul className="task-list-sidebar">
-              {tasks.length === 0 && <li className="empty-tasks">No tasks planned yet</li>}
-              {tasks.map(t => (
-                <li key={t.id} className="sidebar-task-item">
-                  <div className="task-item-content">
-                    <span className="task-label">{t.label}</span>
-                    <span className={`task-status ${t.status}`}>{badge(t.status)}</span>
-                  </div>
-                  {t.status === 'pending' && (
-                    <button className="sidebar-approve-btn" onClick={() => run(t.id)}>Approve</button>
-                  )}
-                  {t.status === 'running' && (
-                    <button className="sidebar-cancel-btn" onClick={() => cancel(t.id)}>Cancel</button>
-                  )}
-                </li>
-              ))}
-            </ul>
+          <div className="user-profile">
+            <div className="avatar">{userName.charAt(0)}</div>
+            <div className="user-info">
+              <span className="user-name">{userName}</span>
+            </div>
           </div>
+        </div>
+      </aside>
 
-          <div className="sidebar-section">
-            <h3>Logs</h3>
-            <button className="logs-toggle-btn" onClick={() => setShowLogs(!showLogs)}>
-              {showLogs ? 'Hide Logs' : 'Show Logs'}
-            </button>
-            {showLogs && (
-              <div className="logs-container">
-                {logs.length === 0 && <p className="no-logs">No logs available</p>}
-                {logs.map((log, index) => (
-                  <div key={index} className="log-entry">
-                    <span className="log-task-id">[{log.id}]</span>
-                    <span className="log-line">{log.line}</span>
-                  </div>
-                ))}
+      {/* Main Content Area */}
+      <main className="app-main">
+        {/* Header / Window Controls */}
+        <header className="app-topbar" style={{ WebkitAppRegion: 'drag' } as any}>
+          <div style={{ WebkitAppRegion: 'no-drag' } as any} className="window-controls">
+            <button onClick={() => window.electronAPI?.minimize()}>-</button>
+            <button onClick={() => window.electronAPI?.maximize()}>[]</button>
+            <button onClick={() => window.electronAPI?.close()}>X</button>
+          </div>
+        </header>
+
+        <div className="app-content-scroll">
+          
+          {activeSection === 'home' && (
+            <>
+              <div className="greeting-section">
+                <h1>Good Morning, {userName}</h1>
+                <p>Here's what's happening with your tasks{historyStats ? ` — ${historyStats.totalTasks} total across all sessions.` : ' today.'}</p>
               </div>
-            )}
-          </div>
 
-          <div className="sidebar-section">
-            <h3>Software Catalog</h3>
-            <button className="catalog-toggle-btn" onClick={() => setShowCatalog(!showCatalog)}>
-              {showCatalog ? 'Hide Catalog' : 'Show Catalog'}
-            </button>
-            <div className="selection-info">
-              {selectedSoftware.length > 0 && (
-                <p><strong>Selected:</strong> {selectedSoftware.length} item(s)</p>
+              {/* Stats Dashboard */}
+              <div className="stats-dashboard">
+                <div className="stat-card">
+                  <div className="stat-icon purple-icon">[#]</div>
+                  <div className="stat-info">
+                    <div className="stat-label">Total Tasks</div>
+                    <div className="stat-value">{tasks.length}</div>
+                  </div>
+                </div>
+                <div className="stat-card completed">
+                  <div className="stat-icon green-icon">[Y]</div>
+                  <div className="stat-info">
+                    <div className="stat-label">Completed</div>
+                    <div className="stat-value">{tasks.filter(t => t.status === 'done').length}</div>
+                  </div>
+                </div>
+                <div className="stat-card in-progress">
+                  <div className="stat-icon blue-icon">[O]</div>
+                  <div className="stat-info">
+                    <div className="stat-label">In Progress</div>
+                    <div className="stat-value">{tasks.filter(t => t.status === 'running').length}</div>
+                  </div>
+                </div>
+                <div className="stat-card pending">
+                  <div className="stat-icon red-icon">[-]</div>
+                  <div className="stat-info">
+                    <div className="stat-label">Pending</div>
+                    <div className="stat-value">{tasks.filter(t => t.status === 'pending').length}</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Task Activity Charts */}
+              {tasks.length > 0 && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1.5rem' }}>
+                  <InteractiveChart data={taskStatusData.values} title="Tasks by Status" labels={taskStatusData.labels} />
+                  <InteractiveChart data={taskTypeData.values} title="Tasks by Type" labels={taskTypeData.labels} />
+                </div>
               )}
-            </div>
-          </div>
 
-          <div className="sidebar-section">
-            <h3>Software Details</h3>
-            <div className="software-info">
-              <p><strong>Version:</strong> 2.0.0</p>
-              <p><strong>Runtime:</strong> Electron + React</p>
-              <p><strong>Supported Tasks:</strong> 4 types</p>
-              <p><strong>Winget Packages:</strong> 50+ verified</p>
-            </div>
-          </div>
-        </aside>
+              <div className="split-layout">
+                {/* Today's Tasks */}
+                <div className="tasks-panel">
+                  <div className="panel-header">
+                    <h2>Today's Tasks</h2>
+                    <button className="add-task-btn" onClick={() => setActiveSection('tasks')}>View All Tasks</button>
+                  </div>
+                  <div className="task-list">
+                    {/* Render real tasks */}
+                    {tasks.length === 0 && (
+                      <div className="task-row" style={{ color: '#8b92a5', fontStyle: 'italic' }}>
+                        <span className="task-title">No tasks yet — ask the AI to plan something!</span>
+                      </div>
+                    )}
+                    {tasks.slice(0, 5).map(t => (
+                      <div className="task-row" key={t.id}>
+                        <input type="checkbox" checked={t.status === 'done'} onChange={() => {}} />
+                        <span className="task-title">{t.label}</span>
+                        <span className="tag pending-tag">{t.type}</span>
+                        <span className="task-time">{t.status}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
 
-        {/* Main Content Area */}
-        <main className="bklit-content">
-          <div className="content-header">
-            <h1>Components</h1>
-            <p>A collection of chart components for your applications.</p>
-          </div>
+                {/* AI Assistant */}
+                <div className="ai-panel">
+                  <div className="panel-header ai-header">
+                    <h2>AI Assistant</h2>
+                    <select value={aiProvider} onChange={e => setAiProvider(e.target.value)} className="model-select">
+                      {AI_PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+                    </select>
+                  </div>
+                  <div className="ai-greeting">
+                    <h3>Hello {userName},</h3>
+                    <p>I'm your AI assistant. How can I help you today?</p>
+                  </div>
+                  
+                  <div className="ai-chat-history" ref={boxRef} style={{minHeight: '150px'}}>
+                    {messages.slice(1, 4).map((m, i) => (
+                      <div key={i} className={`ai-msg ${m.role}`}>{m.text}</div>
+                    ))}
+                  </div>
 
-          {/* Settings Section */}
-          {activeSection === 'settings' && (
-            <div className="settings-section" style={{ padding: '20px', background: 'var(--bklit-panel)', borderRadius: '12px', marginBottom: '20px' }}>
-              <h2>AI Provider Settings</h2>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '15px', marginTop: '15px' }}>
-                <div>
-                  <label style={{ display: 'block', marginBottom: '5px' }}>Provider</label>
-                  <select 
-                    value={aiProvider} 
-                    onChange={e => setAiProvider(e.target.value)}
-                    style={{ width: '100%', padding: '10px', borderRadius: '6px', background: 'var(--bklit-bg)', color: 'var(--bklit-text)', border: '1px solid var(--bklit-border)' }}
-                  >
-                    <option value="openai">OpenAI</option>
-                    <option value="openrouter">OpenRouter</option>
-                    <option value="gemini">Gemini API</option>
-                    <option value="ollama">Ollama (Local)</option>
-                    <option value="lmstudio">LM Studio (Local)</option>
-                  </select>
+                  <div className="ai-input-wrapper">
+                    <input 
+                      type="text" 
+                      placeholder="Ask something..." 
+                      value={input}
+                      onChange={e => setInput(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && send()}
+                    />
+                    <button className="send-btn" onClick={send}>&gt;</button>
+                  </div>
                 </div>
-                <div>
-                  <label style={{ display: 'block', marginBottom: '5px' }}>Model</label>
-                  <input 
-                    type="text" 
-                    value={aiModel} 
-                    onChange={e => setAiModel(e.target.value)}
-                    placeholder="gemini-2.5-pro (or leave blank for default)" 
-                    style={{ width: '100%', padding: '10px', borderRadius: '6px', background: 'var(--bklit-bg)', color: 'var(--bklit-text)', border: '1px solid var(--bklit-border)' }}
-                  />
-                </div>
-                <div>
-                  <label style={{ display: 'block', marginBottom: '5px' }}>API Key</label>
-                  <input 
-                    type="password" 
-                    value={apiKey} 
-                    onChange={e => setApiKey(e.target.value)}
-                    placeholder="sk-..." 
-                    style={{ width: '100%', padding: '10px', borderRadius: '6px', background: 'var(--bklit-bg)', color: 'var(--bklit-text)', border: '1px solid var(--bklit-border)' }}
-                  />
-                </div>
-                <button 
-                  onClick={saveSettings} 
-                  className="bklit-button"
-                  style={{ alignSelf: 'flex-start', padding: '10px 20px' }}
-                >
-                  {configSaved ? 'Saved!' : 'Save Settings'}
-                </button>
               </div>
+
+              {/* Bottom Terminal / Editor Split */}
+              <div className="bottom-ide-panel">
+                <div className="terminal-side">
+                  <div className="tabs">
+                    <span className="tab active">Terminal</span>
+                  </div>
+                  <div className="terminal-content">
+                    <div className="term-line"><span className="prompt" style={{color: '#4ade80'}}>{userName}@Compilator:~$</span> </div>
+                    {logs.slice(-5).map((l, i) => <div key={i} className="term-line">{l.line}</div>)}
+                  </div>
+                </div>
+                <div className="editor-side">
+                  <div className="tabs editor-tabs">
+                    <span className="tab active">main.tsx X</span>
+                  </div>
+                  <div className="editor-content">
+                    <pre style={{margin:0}}>
+                      <code style={{color: '#a78bfa'}}>
+{`  1  import { useState } from 'react'
+  2
+  3  function App() {
+  4    return (
+  5      <div className="container">
+  6        <h1>Compilator IDE</h1>
+  7      </div>
+  8    )
+  9  }`}
+                      </code>
+                    </pre>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {activeSection === 'tasks' && (
+            <div className="task-details-section">
+              <h2>Task Details</h2>
+              {tasks.length === 0 && <p className="empty-state" style={{color: '#8b92a5'}}>No tasks planned yet.</p>}
+              {tasks.map(t => (
+                <div key={t.id} className="task-card" style={{padding: '1rem', background: '#15171e', borderRadius: '8px', marginBottom: '1rem', border: '1px solid #1f2129'}}>
+                  <div className="task-info">
+                    <h3 style={{margin: '0 0 0.5rem 0'}}>{t.label}</h3>
+                    <p style={{margin: '0.2rem 0', color: '#8b92a5'}}><strong>Type:</strong> <code>{t.type}</code></p>
+                    <p style={{margin: '0.2rem 0', color: '#8b92a5'}}><strong>Status:</strong> {t.status}</p>
+                    {t.command && <div className="command-line" style={{marginTop: '0.5rem', background: '#0b0c10', padding: '0.5rem', borderRadius: '4px', fontSize: '0.8rem'}}>{t.command}</div>}
+                  </div>
+                  <div className="task-actions" style={{marginTop: '1rem'}}>
+                    {t.status === 'pending' && <button className="add-task-btn" onClick={() => run(t.id)}>Approve</button>}
+                    {t.status === 'running' && <button className="add-task-btn" onClick={() => cancel(t.id)}>Cancel</button>}
+                    {(t.status === 'failed' || t.status === 'cancelled') && <button className="add-task-btn" onClick={() => retry(t.id)} style={{background: '#f59e0b', color: '#000'}}>Retry</button>}
+                    {reports[t.id] && <button className="add-task-btn" onClick={() => openReport(t.id)} style={{marginLeft: '0.5rem'}}>View Report</button>}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
 
-          {/* AI Chat Section */}
-          <div className="ai-chat-section">
-            <h2>AI Assistant</h2>
-            <div className="chat-box" ref={boxRef}>
-              {messages.map((m, i) => <div key={i} className={`message ${m.role}`}>{m.text}</div>)}
-            </div>
-            <div className="chat-input-area">
-              <input 
-                value={input} 
-                onChange={e => setInput(e.target.value)} 
-                onKeyDown={e => e.key === 'Enter' && send()} 
-                placeholder='e.g. "install git" or "create folder C:/AI"' 
-                disabled={sending} 
-                className="bklit-input"
-              />
-              <button onClick={send} disabled={sending || !input.trim()} className="bklit-button">
-                {sending ? 'Planning...' : 'Send'}
-              </button>
-            </div>
-          </div>
-
-          {/* Software Catalog Section */}
-          {showCatalog && (
+          {activeSection === 'catalog' && (
             <div className="software-catalog-section">
-              <div className="catalog-header">
-                <h2>Software Catalog</h2>
-                <p>Browse and select software to install multiple packages at once</p>
+              <div className="catalog-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem'}}>
+                <div>
+                  <h2 style={{margin: '0 0 0.5rem 0'}}>Software Catalog</h2>
+                  <p style={{margin: 0, color: '#8b92a5'}}>Select software to install multiple packages.</p>
+                </div>
                 {selectedSoftware.length > 0 && (
-                  <button className="install-selected-btn" onClick={installSelectedSoftware}>
+                  <button className="add-task-btn" onClick={installSelectedSoftware} style={{background: '#4f46e5', color: '#fff'}}>
                     Install Selected ({selectedSoftware.length})
                   </button>
                 )}
               </div>
               <div className="catalog-content">
                 {Object.entries(getCatalogByCategory()).map(([category, items]) => (
-                  <div key={category} className="catalog-category">
-                    <h3>{category}</h3>
-                    <div className="catalog-items">
+                  <div key={category} className="catalog-category" style={{marginBottom: '2rem'}}>
+                    <h3 style={{borderBottom: '1px solid #1f2129', paddingBottom: '0.5rem', margin: '0 0 1rem 0'}}>{category}</h3>
+                    <div className="catalog-items" style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '1rem'}}>
                       {items.map((item) => (
                         <div 
                           key={`${item.key}-${item.id}`} 
-                          className={`catalog-item ${selectedSoftware.includes(item.id) ? 'selected' : ''}`}
                           onClick={() => toggleSoftwareSelection(item.id)}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem', 
+                            background: selectedSoftware.includes(item.id) ? '#1c1e26' : '#15171e', 
+                            border: `1px solid ${selectedSoftware.includes(item.id) ? '#818cf8' : '#1f2129'}`,
+                            borderRadius: '8px', cursor: 'pointer'
+                          }}
                         >
-                          <div className="catalog-item-checkbox">
-                            {selectedSoftware.includes(item.id) && '✓'}
+                          <div style={{width: '20px', height: '20px', border: '1px solid #8b92a5', borderRadius: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: selectedSoftware.includes(item.id) ? '#818cf8' : 'transparent', color: '#fff', fontSize: '12px'}}>
+                            {selectedSoftware.includes(item.id) ? 'Y' : ''}
                           </div>
-                          <div className="catalog-item-info">
-                            <div className="catalog-item-name">{item.name}</div>
-                            <div className="catalog-item-id">{item.id}</div>
+                          <div style={{flex: 1}}>
+                            <div style={{fontWeight: 500, fontSize: '0.95rem'}}>{item.name}</div>
+                            <div style={{color: '#8b92a5', fontSize: '0.75rem'}}>{item.id}</div>
                           </div>
+                          <button
+                            className="add-task-btn"
+                            style={{padding: '0.4rem 0.8rem', fontSize: '0.8rem', zIndex: 2}}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              send(`install ${item.name}`);
+                            }}
+                          >
+                            Approve
+                          </button>
                         </div>
                       ))}
                     </div>
@@ -782,71 +1036,164 @@ function App() {
             </div>
           )}
 
-          {/* Charts Section */}
-          <div className="charts-section">
-            <h2>Performance Charts</h2>
-            <div className="charts-grid">
-              <InteractiveChart data={chartData.taskCompletion} title="Task Completion Rate" />
-              <InteractiveChart data={chartData.systemResources} title="System Resources" />
-              <InteractiveChart data={chartData.installationTime} title="Installation Time (s)" />
-            </div>
-          </div>
-
-          {/* Skipped Requests */}
-          {skipped.length > 0 && (
-            <div className="skipped-panel">
-              <h3>Skipped requests</h3>
-              {skipped.map((s, i) => {
-                const requestText = String(s?.request ?? '').trim();
-                const reasonText = String(s?.reason ?? '').trim();
-                return (
-                  <div key={i} className="skipped-item">
-                    <strong>"{requestText && requestText !== '{}' ? requestText : '(unknown request)'}"</strong>
-                    {' — '}
-                    {reasonText || 'Unable to create a task from this request.'}
+          {activeSection === 'ai_chat' && (
+            <div className="ai-chat-section" style={{height: '100%', display: 'flex', flexDirection: 'column'}}>
+              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem'}}>
+                <h2 style={{margin: 0}}>AI Assistant (Full View)</h2>
+                <select value={aiProvider} onChange={e => setAiProvider(e.target.value)} className="model-select">
+                  {AI_PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+                </select>
+              </div>
+              <div className="chat-box" ref={boxRef} style={{flex: 1, overflowY: 'auto', background: '#111217', padding: '1.5rem', borderRadius: '12px', border: '1px solid #1f2129', marginBottom: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem'}}>
+                {messages.map((m, i) => (
+                  <div key={i} className={`ai-msg ${m.role}`} style={{
+                    alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
+                    background: m.role === 'user' ? '#4f46e5' : '#15171e',
+                    padding: '1rem', borderRadius: '8px', border: m.role === 'ai' ? '1px solid #1f2129' : 'none',
+                    maxWidth: '80%'
+                  }}>
+                    {m.text}
                   </div>
-                );
-              })}
+                ))}
+              </div>
+              <div className="ai-input-wrapper">
+                <input 
+                  type="text" 
+                  placeholder="Ask something..." 
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && send()}
+                />
+                <button className="send-btn" onClick={send}>&gt;</button>
+              </div>
             </div>
           )}
 
-          {/* Task Details */}
-          <div className="task-details-section">
-            <h2>Task Details</h2>
-            {tasks.length === 0 && <p className="empty-state">No tasks yet. Ask the planner to prepare your AI development PC.</p>}
-            {tasks.map(t => (
-              <div key={t.id} className="task-card" data-status={t.status}>
-                <div className="task-info">
-                  <h3>{t.label}</h3>
-                  <p><strong>Type:</strong> <code>{t.type}</code></p>
-                  <p><strong>Est. Time:</strong> {t.estimated_seconds === 0 ? '0s' : `~${t.estimated_seconds}s`}</p>
-                  {t.params.path && <p><strong>Path:</strong> <code>{t.params.path}</code></p>}
-                  {t.params.id && <p><strong>Winget ID:</strong> <code>{t.params.id}</code></p>}
-                  {t.note && <p><strong>Note:</strong> {t.note}</p>}
-                  {t.command && <div className="command-line">{t.command}</div>}
+          {activeSection === 'settings' && (
+            <div className="settings-section" style={{ padding: '2rem', background: '#111217', borderRadius: '12px', border: '1px solid #1f2129' }}>
+              <h2>Settings</h2>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', marginTop: '1.5rem', maxWidth: '500px' }}>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: '#8b92a5' }}>AI Provider</label>
+                  <select 
+                    value={aiProvider} 
+                    onChange={e => setAiProvider(e.target.value)}
+                    className="model-select"
+                    style={{width: '100%', padding: '0.8rem'}}
+                  >
+                    {AI_PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+                  </select>
                 </div>
-                <div className="task-actions">
-                  {t.status === 'pending' && <button className="approve-btn" onClick={() => run(t.id)}>Approve</button>}
-                  {t.status === 'running' && <button className="cancel-btn" onClick={() => cancel(t.id)}>Cancel</button>}
-                  {t.status !== 'pending' && t.status !== 'running' && <span className={`badge ${t.status}`}>{badge(t.status)}</span>}
-                  {reports[t.id] && <button className="report-btn" onClick={() => openReport(t.id)}>View Report</button>}
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: '#8b92a5' }}>Model ID</label>
+                  <input 
+                    type="text" 
+                    value={aiModel} 
+                    onChange={e => setAiModel(e.target.value)}
+                    placeholder="Leave blank for default" 
+                    style={{ width: '100%', padding: '0.8rem', borderRadius: '8px', background: '#15171e', color: '#fff', border: '1px solid #2a2d39' }}
+                  />
                 </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: '#8b92a5' }}>API Key</label>
+                  <input 
+                    type="password" 
+                    value={apiKey} 
+                    onChange={e => setApiKey(e.target.value)}
+                    placeholder="sk-..." 
+                    style={{ width: '100%', padding: '0.8rem', borderRadius: '8px', background: '#15171e', color: '#fff', border: '1px solid #2a2d39' }}
+                  />
+                </div>
+                <button 
+                  onClick={saveSettings} 
+                  className="add-task-btn"
+                  style={{ alignSelf: 'flex-start' }}
+                >
+                  {configSaved ? 'Saved!' : 'Save Settings'}
+                </button>
               </div>
-            ))}
-          </div>
-        </main>
-      </div>
+            </div>
+          )}
 
-      {/* Footer */}
-      <footer className="bklit-footer">
-        <div className="footer-left">
-          <span>VERCEL INC. // 2026</span>
-          <span>OPEN SOURCE SOFTWARE PROGRAM</span>
+          {activeSection === 'editor' && (
+            <CodeEditor
+              onRunScript={(code, language) => {
+                // Save temp script and create a task to run it
+                const ext = language === 'python' ? '.py' : '.ps1';
+                const taskType = language === 'python' ? 'run_python' : 'run_powershell';
+                const tempPath = `C:/AI/Workspace/temp_script${ext}`;
+                // First write the file, then run it
+                const writeTasks: PlannerTask[] = [
+                  {
+                    type: 'write_file',
+                    label: `Save script to ${tempPath}`,
+                    params: { path: tempPath, content: code },
+                    estimated_seconds: 2,
+                    status: 'pending',
+                  },
+                  {
+                    type: taskType,
+                    label: `Run ${language} script`,
+                    params: { script_path: tempPath, args: [] },
+                    estimated_seconds: 30,
+                    status: 'pending',
+                  },
+                ];
+                integrate(writeTasks);
+                setActiveSection('tasks');
+              }}
+            />
+          )}
+
+          {activeSection === 'terminal' && (
+            <TerminalPanel logs={logs} />
+          )}
+
+          {activeSection === 'history' && (
+            <TaskHistory
+              onOpenReport={(reportPath) => {
+                if (window.electronAPI?.openReport) {
+                  window.electronAPI.openReport(reportPath);
+                }
+              }}
+            />
+          )}
+
         </div>
-        <div className="footer-right">
-          <span>▲</span>
-        </div>
-      </footer>
+      </main>
+
+      {/* Floating Terminal Windows */}
+      {Object.keys(terminalWindows).map(taskId => {
+        const task = tasks.find(t => t.id === taskId);
+        if (!task) return null;
+        const tw = terminalWindows[taskId];
+        const taskLogs = logs.filter(l => l.id === taskId).map(l => l.line);
+        const maxZ = Math.max(...Object.values(terminalWindows).map(w => w.zIndex), 0);
+        return (
+          <FloatingTerminal
+            key={taskId}
+            taskId={taskId}
+            title={task.label}
+            logs={taskLogs}
+            status={task.status}
+            reportPath={reports[taskId]}
+            bounds={tw.bounds}
+            onBoundsChange={(b) => updateTerminalBounds(taskId, b)}
+            zIndex={tw.zIndex}
+            focused={tw.zIndex === maxZ}
+            minimized={tw.minimized}
+            onToggleMinimize={() => toggleMinimizeTerminal(taskId)}
+            onFocus={() => focusTerminal(taskId)}
+            onClose={() => closeTerminal(taskId)}
+            onViewReport={() => openReport(taskId)}
+            onOpenReportFolder={() => {
+              if (reports[taskId] && window.electronAPI?.openReportFolder) {
+                window.electronAPI.openReportFolder(reports[taskId]);
+              }
+            }}
+          />
+        );
+      })}
     </div>
   );
 }

@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "main": "main.cjs",
   "scripts": {
-    "dev": "concurrently \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env NODE_ENV=development AI_PROVIDER=openai electron .\"",
+    "dev": "concurrently \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env NODE_ENV=development node run-electron.cjs .\"",
     "dev:web": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
@@ -13,6 +13,9 @@
     "start-omniroute-proxy": "node ./ai/omniroute-proxy.cjs"
   },
   "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "chart.js": "^4.5.1",
     "react": "^19.2.8",
     "react-chartjs-2": "^5.3.1",

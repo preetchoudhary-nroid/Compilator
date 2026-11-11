@@ -2,7 +2,27 @@ const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+
+// Auto-load .env if present
+try {
+  const envPath = path.join(__dirname, '.env');
+  if (fs.existsSync(envPath)) {
+    const content = fs.readFileSync(envPath, 'utf8');
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq !== -1) {
+        const key = trimmed.slice(0, eq).trim();
+        const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+        if (!process.env[key]) process.env[key] = val;
+      }
+    }
+  }
+} catch (_) {}
+
 const { createAssistant } = require('./ai/index.cjs');
+const store = require('./store.cjs');
 const {
   extractInstallTarget,
   isNegated,
@@ -190,6 +210,37 @@ async function finishTaskRun(id, { status, exitCode, error }) {
   const reportPath = await writeTaskReport(run);
   if (reportPath) safeSend(run.wc, 'task:reportCreated', { id, reportPath });
   else if (!run.wc || run.wc.isDestroyed()) console.warn('Main window closed before report for task', id, 'was delivered.');
+
+  // Persist task to history store
+  const durationSeconds = Math.max(0, Math.round((run.finishedAt - run.startedAt) / 1000));
+  store.saveTask({
+    id,
+    type: run.task.type,
+    label: run.task.label,
+    params: run.task.params || {},
+    status: run.status,
+    startedAt: run.startedAt.toISOString(),
+    finishedAt: run.finishedAt.toISOString(),
+    durationSeconds,
+    command: run.task.command || null,
+    exitCode: run.exitCode,
+    reportPath: reportPath || null,
+    sessionDate: new Date().toISOString().slice(0, 10),
+  });
+
+  // Desktop notification on task completion
+  try {
+    const { Notification } = require('electron');
+    if (Notification && Notification.isSupported()) {
+      const notif = new Notification({
+        title: status === 'done' ? '✅ Task Completed' : status === 'failed' ? '❌ Task Failed' : `Task ${status}`,
+        body: run.task.label,
+        silent: status === 'done',
+      });
+      notif.show();
+    }
+  } catch { /* notification failure is non-critical */ }
+
   activeTaskRuns.delete(id);
 }
 
@@ -201,7 +252,7 @@ async function finishTaskRun(id, { status, exitCode, error }) {
 //
 // Allowed task types: mkdir, winget_install, winget_list, write_file, list_exe_files, run_python.
 // ---------------------------------------------------------------------------
-const SUPPORTED_TASK_TYPES = ['mkdir', 'winget_install', 'winget_list', 'write_file', 'list_exe_files', 'run_python'];
+const SUPPORTED_TASK_TYPES = ['mkdir', 'winget_install', 'winget_list', 'write_file', 'list_exe_files', 'run_python', 'run_powershell'];
 // Compatibility alias used throughout the codebase
 const ALLOWED_TYPES = SUPPORTED_TASK_TYPES;
 
@@ -316,6 +367,7 @@ const ESTIMATES = {
   write_file: 3,
   list_exe_files: 15,
   run_python: 30,
+  run_powershell: 30,
 };
 
 // Parse "winget list" output: columns are Name / Id / Version / Available / Source.
@@ -560,6 +612,27 @@ function planSingleRequest(text, installed, pushSkip) {
       }
     } catch (err) {
       pushSkip(text || '(empty request)', `Invalid Python script path: ${err.message}`);
+    }
+    return { tasks };
+  }
+
+  // ---- run_powershell ----------------------------------------------------
+  const psMatch = text.match(/(?:run|execute)\s+(?:powershell\s+)?(?:script\s+)?(.+?\.ps1)(?:\s+(?:with|using)\s+(.+))?$/);
+  if (psMatch) {
+    try {
+      const scriptPath = psMatch[1].trim();
+      const args = psMatch[2] ? psMatch[2].trim().split(/\s+/) : [];
+      if (scriptPath) {
+        tasks.push({
+          type: 'run_powershell',
+          label: `Run PowerShell script ${scriptPath}`,
+          params: { script_path: scriptPath, args },
+          estimated_seconds: ESTIMATES.run_powershell,
+          status: 'pending',
+        });
+      }
+    } catch (err) {
+      pushSkip(text || '(empty request)', `Invalid PowerShell script path: ${err.message}`);
     }
     return { tasks };
   }
@@ -1061,6 +1134,51 @@ const TASK_RUNNERS = {
       finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
     }
   },
+  'run_powershell': (task, wc) => {
+    const scriptPath = task.params.script_path;
+    const args = task.params.args || [];
+    const command = `powershell -File ${scriptPath} ${args.join(' ')}`;
+    const run = startTaskRun(task, wc, command);
+
+    const proc = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args]);
+    runningProcesses.set(task.id, proc);
+
+    proc.stdout.on('data', (data) => {
+      run.stdout.push(data.toString());
+      safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
+    });
+    proc.stderr.on('data', (data) => {
+      run.stderr.push(data.toString());
+      safeSend(wc, 'task:log', { id: task.id, line: data.toString() });
+    });
+    proc.on('error', (err) => {
+      runningProcesses.delete(task.id);
+      if (run.cancelled) {
+        run.error = err;
+        safeSend(wc, 'task:log', { id: task.id, line: `\n[cancelled] ${err.message}\n` });
+        safeSend(wc, 'task:update', { id: task.id, status: 'cancelled' });
+        finishTaskRun(task.id, { status: 'cancelled', exitCode: null, error: err });
+        return;
+      }
+      run.error = err;
+      safeSend(wc, 'task:log', { id: task.id, line: `[error] ${err.message}\n` });
+      safeSend(wc, 'task:update', { id: task.id, status: 'failed' });
+      finishTaskRun(task.id, { status: 'failed', exitCode: null, error: err });
+    });
+    proc.on('close', (code) => {
+      runningProcesses.delete(task.id);
+      if (run.cancelled) {
+        safeSend(wc, 'task:log', { id: task.id, line: `[powershell] exit code ${code} (cancelled)\n` });
+        safeSend(wc, 'task:update', { id: task.id, status: 'cancelled', exitCode: code });
+        finishTaskRun(task.id, { status: 'cancelled', exitCode: code, error: new Error('User cancelled') });
+        return;
+      }
+      safeSend(wc, 'task:log', { id: task.id, line: `[powershell] exit code ${code}\n` });
+      const status = code === 0 ? 'done' : 'failed';
+      safeSend(wc, 'task:update', { id: task.id, status, exitCode: code });
+      finishTaskRun(task.id, { status, exitCode: code, error: status === 'failed' ? new Error(`Process exited with code ${code}`) : null });
+    });
+  },
 };
 
 function createWindow() {
@@ -1129,6 +1247,7 @@ ipcMain.on('window:normal-mode', () => {
 });
 
 app.whenReady().then(() => {
+  store.initStore(app);
   ensureAIDirs();
   createWindow();
 
@@ -1355,6 +1474,34 @@ ipcMain.handle('save-config', async (event, config) => {
     return { success: true };
   } catch (e) {
     console.error('Failed to save config', e);
+    return { success: false, error: e.message };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// IPC: Task History & Stats (Phase 2 — persistence layer)
+// ---------------------------------------------------------------------------
+ipcMain.handle('get-task-history', async (_event, filters) => {
+  try {
+    return { success: true, tasks: store.getTasks(filters || {}) };
+  } catch (e) {
+    return { success: false, error: e.message, tasks: [] };
+  }
+});
+
+ipcMain.handle('get-task-stats', async () => {
+  try {
+    return { success: true, stats: store.getStats() };
+  } catch (e) {
+    return { success: false, error: e.message, stats: null };
+  }
+});
+
+ipcMain.handle('clear-task-history', async () => {
+  try {
+    store.clearTasks();
+    return { success: true };
+  } catch (e) {
     return { success: false, error: e.message };
   }
 });

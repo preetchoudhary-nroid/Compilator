@@ -15,6 +15,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openReportFolder: (reportPath) => ipcRenderer.invoke('open-report-folder', reportPath),
   saveConfig: (config) => ipcRenderer.invoke('save-config', config),
   getConfig: () => ipcRenderer.invoke('get-config'),
+
+  // Task history & stats (persistent store)
+  getTaskHistory: (filters) => ipcRenderer.invoke('get-task-history', filters),
+  getTaskStats: () => ipcRenderer.invoke('get-task-stats'),
+  clearTaskHistory: () => ipcRenderer.invoke('clear-task-history'),
   
   // Window controls
   minimize: () => ipcRenderer.send('window:minimize'),

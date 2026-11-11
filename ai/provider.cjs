@@ -21,12 +21,7 @@ const REQUEST_TIMEOUT_MS = 60000;
 
 /** Human-readable provider name for context messages. */
 const PROVIDER_LABELS = {
-  ollama: 'Ollama',
-  lmstudio: 'LM Studio',
-  openai: 'OpenAI',
-  openrouter: 'OpenRouter',
-  gemini: 'Gemini',
-  custom: 'Custom',
+  groq: 'Groq',
 };
 
 /**

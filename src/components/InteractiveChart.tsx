@@ -22,11 +22,12 @@ ChartJS.register(
 interface InteractiveChartProps {
   data: number[];
   title: string;
+  labels?: string[];
 }
 
-export const InteractiveChart: React.FC<InteractiveChartProps> = ({ data, title }) => {
+export const InteractiveChart: React.FC<InteractiveChartProps> = ({ data, title, labels: customLabels }) => {
   const chartData = {
-    labels: data.map((_, i) => `Point ${i + 1}`),
+    labels: customLabels || data.map((_, i) => `Point ${i + 1}`),
     datasets: [
       {
         label: title,

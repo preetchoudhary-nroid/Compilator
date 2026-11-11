@@ -29,7 +29,11 @@ Module._load = function (request, parent, isMain) {
         loadURL() {}
         on() {}
       },
-      ipcMain: { handle: async () => {}, removeHandler: () => {} },
+      ipcMain: { handle: async () => {}, removeHandler: () => {}, on: () => {} },
+      Notification: class {
+        static isSupported() { return true; }
+        show() {}
+      },
       shell: { openPath: async () => ({}) },
     };
   }
