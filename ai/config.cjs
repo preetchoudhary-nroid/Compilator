@@ -75,6 +75,7 @@ function loadAIConfig({ app } = {}) {
   const serverUrl = String(process.env.AI_SERVER_URL || file.serverUrl || defaults.serverUrl);
   const model = String(
     process.env.AI_MODEL ||
+    process.env.GROQ_MODEL ||
     file.model ||
     'openai/gpt-oss-120b'
   );

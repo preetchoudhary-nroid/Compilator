@@ -12,7 +12,7 @@ try {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
       const eq = trimmed.indexOf('=');
-      if (eq !== -1) {
+      if (eq !== -1) {3
         const key = trimmed.slice(0, eq).trim();
         const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
         if (!process.env[key]) process.env[key] = val;
@@ -988,8 +988,14 @@ function streamWinget(task, wc, args, command, logPrefix) {
 
 const TASK_RUNNERS = {
   'winget_install': (task, wc) => {
-    const id = task.params.id;
-    streamWinget(task, wc, ['install', '--id', id, '--silent'], `winget install --id ${id} --silent`, '[winget]');
+    let id = task.params.id;
+    // Google.Chrome MSI manifest frequently has hash mismatches in Winget repo
+    // due to Google updating the static CDN file. Google.Chrome.EXE is version-pinned and passes.
+    if (id === 'Google.Chrome') {
+      id = 'Google.Chrome.EXE';
+    }
+    const args = ['install', '--id', id, '-e', '--silent', '--accept-package-agreements', '--accept-source-agreements'];
+    streamWinget(task, wc, args, `winget ${args.join(' ')}`, '[winget]');
   },
   'winget_list': (task, wc) => {
     streamWinget(task, wc, ['list', '--accept-source-agreements'], 'winget list --accept-source-agreements', '[winget]');
@@ -1417,9 +1423,20 @@ ipcMain.handle('chat-with-ai', async (event, { prompt, requestId }) => {
     // requests; everything else stays conversational.
     const plan = planFromRequest(prompt || '', installed);
     let result;
-    // Surface the plan even when it only contains skipped requests, so the user
-    // always sees *why* nothing was planned.
-    if (plan.tasks.length > 0 || plan.tasks_skipped.length > 0) {
+    // Check if the prompt is a greeting or general conversational query
+    const cleanPrompt = (prompt || '').trim().toLowerCase().replace(/[?!.,]+$/, '');
+    const isGreeting = /^(hi|hello|hey|yo|namaste|hola|greetings|help|who are you|what can you do)$/i.test(cleanPrompt);
+
+    if (isGreeting) {
+      result = {
+        success: true,
+        intent: 'CHAT',
+        reply: "Hello! I'm Compilator, your desktop assistant. How can I help you today? You can ask me to install software (e.g., 'install git'), run Python or PowerShell scripts, create folders, or write files." + (suggestion || ''),
+        tasks: [],
+        tasks_skipped: [],
+        source: 'planner',
+      };
+    } else if (plan.tasks.length > 0 || plan.tasks_skipped.length > 0) {
       result = {
         success: true,
         intent: 'TASK',

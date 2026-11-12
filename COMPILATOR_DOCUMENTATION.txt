@@ -1,0 +1,390 @@
+================================================================================
+                       COMPILATOR — SYSTEM SPECIFICATION & GUIDE
+          Full Architecture, Features, UI Breakdown, Software Stack & Free APIs
+================================================================================
+Generated for: Preet
+Application: Compilator Desktop Assistant & System Orchestrator
+Technology: Electron + React 19 + TypeScript + Vite + Tailwind/Custom CSS
+Environment: Windows (PowerShell, Winget, Python 3.13)
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+1. SYSTEM OVERVIEW & ARCHITECTURAL PHILOSOPHY
+2. CORE ARCHITECTURE & IPC MESSAGING
+3. COMPLETE FEATURE & UI MATRIX
+   3.1 Window Management & Sidebar Modes
+   3.2 Home Dashboard & Real Analytics
+   3.3 Interactive Task Queue & Error Recovery
+   3.4 Natural Language AI Planner & Deterministic Fallback
+   3.5 Drag-and-Drop Script Runner
+   3.6 Software Catalog & Bulk Provisioner
+   3.7 Embedded Monaco Code Editor
+   3.8 Live Terminal & Floating Terminal Window
+   3.9 Task Persistence & Searchable History
+   3.10 Desktop Notifications
+4. SUPPORTED TASK ENGINE EXECUTORS
+5. AI PROVIDER INTEGRATION & BEST FREE APIS
+   5.1 Best Free APIs Compared
+   5.2 Setup Instructions & Endpoints
+6. SECURITY & SECRETS ARCHITECTURE
+7. REPOSITORY STRUCTURE & CODEBASE MAP
+8. RUNNING & BUILDING COMPILATOR
+
+
+================================================================================
+1. SYSTEM OVERVIEW & ARCHITECTURAL PHILOSOPHY
+================================================================================
+
+Compilator is a hybrid desktop artificial intelligence assistant and operating 
+system automation orchestrator. It bridges high-level human natural language 
+(English, Hindi/Hinglish) with low-level Windows execution (Winget packaging, 
+PowerShell scripting, Python execution, file system management, and telemetry).
+
+Key Design Tenets:
+- Privacy First & Local Capable: Capable of running 100% offline using local LLMs 
+  (Ollama, LM Studio) or deterministic rule-based planning when no AI key is present.
+- Non-Blocking Asynchronous Execution: Long-running system tasks (software installs, 
+  heavy Python scripts, directory scans) run in dedicated child processes with 
+  streaming stdout/stderr logs piped directly to the user interface.
+- Zero Ghost Data: Real statistics derived strictly from disk-persisted history 
+  and active state—no hardcoded placeholders or mock metrics.
+- Fail-Safe Sandboxing: Strict validation on executable paths, drive roots, and 
+  PowerShell syntax to prevent accidental injection or command corruption.
+
+
+================================================================================
+2. CORE ARCHITECTURE & IPC MESSAGING
+================================================================================
+
+Compilator uses Electron's modern multi-process architecture with strict isolation:
+
++------------------------------------------------------------------------------+
+| RENDERER PROCESS (React 19 + TypeScript + Vite)                              |
+| - UI Components: Dashboard, TaskQueue, Catalog, Monaco Editor, Terminal      |
+| - State Management: React useState / useEffect / useCallback / useRef       |
+| - Local Guardrails: Client-side browserPlanner fallback parser              |
++------------------------------------------------------------------------------+
+                                |  (window.electronAPI)
+                                v
++------------------------------------------------------------------------------+
+| PRELOAD SCRIPT (preload.cjs)                                                 |
+| - Context Isolation: contextBridge.exposeInMainWorld('electronAPI', {...})  |
+| - Type-Safe Channels: IPC invoke (async requests) & IPC on (event streams)  |
++------------------------------------------------------------------------------+
+                                |  (ipcMain / ipcRenderer)
+                                v
++------------------------------------------------------------------------------+
+| MAIN PROCESS (main.cjs + Node 24 runtime)                                    |
+| - App Lifecycle, Window Management, Screen Display geometry                  |
+| - Task Execution: child_process.spawn (PowerShell, Winget, Python)           |
+| - Local JSON Database: store.cjs (Electron userData directory)               |
+| - Desktop OS Notifications: Electron Notification API                        |
+| - Safe Process Launcher: run-electron.cjs (strips ELECTRON_RUN_AS_NODE)      |
++------------------------------------------------------------------------------+
+                                |
+                                v
++------------------------------------------------------------------------------+
+| AI ORCHESTRATION LAYER (ai/ folder)                                          |
+| - ai/index.cjs: Assistant orchestrator, intent router, context builder       |
+| - ai/provider.cjs: Provider client (Groq, OpenAI, Ollama, LM Studio, etc.)   |
+| - ai/config.cjs: Config reader with .env and JSON fallback                   |
+| - src/planner-core.js / .cjs: Dual CJS/ESM tokenizer & intent analyzer      |
++------------------------------------------------------------------------------+
+
+
+================================================================================
+3. COMPLETE FEATURE & UI MATRIX
+================================================================================
+
+3.1 WINDOW MANAGEMENT & SIDEBAR MODES
+-------------------------------------
+- Frameless Window with Custom Titlebar: Minimize, Maximize/Restore, Close controls.
+- Docked Sidebar Mode:
+  * IPC Channel: 'window:sidebar-mode'
+  * Snaps Compilator into a 400px-wide sidebar pinned to the right edge of the screen.
+  * Sets window to 'alwaysOnTop', allowing it to float beside IDEs, browser windows,
+    or games for continuous co-pilot assistance.
+- Normal Mode:
+  * Restores window to a centered 1280x840 work desktop.
+
+3.2 HOME DASHBOARD & REAL ANALYTICS
+-----------------------------------
+- Personalized Header: Dynamic user greetings ("Welcome back, Preet").
+- Accurate Stat Cards:
+  * Total Tasks (All-time recorded from disk store).
+  * Completed Tasks (Count of successfully finished operations).
+  * Failed Tasks (Count of aborted or error-terminated runs).
+  * Active Tasks (Current pending or running jobs).
+- Daily Progress Widget:
+  * Dynamic visual completion gauge showing completed/total for today's tasks.
+- Interactive Analytics Chart (Chart.js / react-chartjs-2):
+  * Dynamic bar and doughnut charts analyzing task distributions by type 
+    (winget_install, run_python, run_powershell, mkdir, write_file) and outcomes.
+
+3.3 INTERACTIVE TASK QUEUE & ERROR RECOVERY
+-------------------------------------------
+- Lifecycle Status Badges:
+  * Pending (Grey): Queued for execution.
+  * Running (Amber animated): Currently active child process.
+  * Completed (Emerald): Finished with exitCode 0.
+  * Failed (Crimson): Exited with error code or stderr output.
+  * Cancelled (Slate): Aborted by user request.
+  * Already Installed (Teal): Winget package already confirmed in system.
+- Per-Task Controls:
+  * "Run Now" / "Cancel" triggers.
+  * Error Recovery Retry Button: Appears automatically on failed/cancelled tasks 
+    to clone the task parameters and re-enqueue a fresh attempt.
+  * "View Report" Action: Opens formatted markdown/HTML execution logs in the 
+    native system browser/editor.
+
+3.4 NATURAL LANGUAGE AI PLANNER & DETERMINISTIC FALLBACK
+--------------------------------------------------------
+- Conversational Task Generation: Accepts casual prompts like:
+  * "prepare my AI development pc" -> Plans git, python, vscode, nodejs.
+  * "create folder C:/AI and write file test.py" -> Generates mkdir + write_file.
+  * "yr chrome install krde bhai" -> Accurately resolves Google.Chrome.
+- Safe Negation Handling: Built-in parser immediately blocks execution on phrases 
+  like "don't install", "cancel install", "never mind", "I changed my mind".
+- 100% Offline Fallback: If AI is unreachable, `src/planner-core.js` analyzes the 
+  prompt using deterministic regex tokenizers and resolves known software targets.
+
+3.5 DRAG-AND-DROP SCRIPT RUNNER
+-------------------------------
+- Drop Zone: Drop any `.py` (Python) or `.ps1` (PowerShell) file anywhere into the app.
+- Automatic Task Creation: Compilator reads file path, detects type, labels the 
+  action, and queues a `run_python` or `run_powershell` task immediately.
+
+3.6 SOFTWARE CATALOG & BULK PROVISIONER
+---------------------------------------
+- Built-in Curated Package Library:
+  * Development: VS Code, Node.js LTS, Python 3.13, Git, GitHub Desktop, Go, Rust.
+  * Databases: DBeaver Community, Postman.
+  * Productivity: Notion, Obsidian, LibreOffice, PowerToys.
+  * Media: VLC Media Player, OBS Studio, Blender.
+  * Browsers: Google Chrome, Firefox, Brave, Microsoft Edge.
+  * System Tools: 7-Zip, Windows Terminal, Tailscale, Wireshark, PuTTY.
+- Bulk Selection: Check multiple packages and click "Install Selected" to auto-generate 
+  a serial provisioning pipeline.
+
+3.7 EMBEDDED MONACO CODE EDITOR
+-------------------------------
+- Full-featured VS Code-style editor powered by `@monaco-editor/react`.
+- Supports 9 languages: Python, PowerShell, JavaScript, TypeScript, JSON, HTML, 
+  CSS, Markdown, Shell.
+- Dark theme styling matching the Compilator obsidian design palette.
+- Integrated "Run Script" action: Directly invokes Python or PowerShell without 
+  leaving the application.
+
+3.8 LIVE TERMINAL & FLOATING TERMINAL WINDOW
+--------------------------------------------
+- Dedicated Terminal Panel: Real-time system log monitor with ANSI color rendering.
+- Embedded Command Dispatcher: Type natural language commands directly in the 
+  terminal prompt to trigger the AI planner.
+- Floating Terminal Sidecar:
+  * Draggable, resizable, minimizable floating window.
+  * Automatically pops open when tasks start executing so you can inspect output 
+    without switching views.
+  * Z-index focus management (clicking brings it to front).
+
+3.9 TASK PERSISTENCE & SEARCHABLE HISTORY
+-----------------------------------------
+- Persistence Engine: `store.cjs` writes task records to `tasks_history.json` inside 
+  the Electron application data directory (`%APPDATA%/compilator`).
+- Auto-Trimming: Keeps the database fast and light by auto-capping at 1,000 tasks.
+- History View (`TaskHistory.tsx`):
+  * Instant search bar (searches labels, task types, commands, and parameters).
+  * Filter dropdowns: Status (Completed/Failed) and Task Type.
+  * Duration metrics: Displays runtime in seconds for every executed script.
+  * "Clear History" modal with double confirmation.
+
+3.10 DESKTOP NOTIFICATIONS
+--------------------------
+- Native Windows 10/11 toast notifications via Electron's `Notification` module.
+- Triggers upon task completion or failure when Compilator is minimized or in the background.
+
+
+================================================================================
+4. SUPPORTED TASK ENGINE EXECUTORS
+================================================================================
+
+Compilator's main process (`main.cjs`) implements low-level execution handlers:
+
+1. `winget_install`:
+   - Command: `winget install --id <ID> -e --silent --accept-package-agreements --accept-source-agreements`
+   - Detects pre-installed packages to avoid redundant downloads.
+   - Streams live installation progress.
+
+2. `winget_list`:
+   - Command: `winget list`
+   - Enumerates software inventory on the host system.
+
+3. `run_python`:
+   - Command: `python -u <scriptPath>` (or direct python interpreter execution)
+   - Real-time stdout and stderr piping.
+
+4. `run_powershell`:
+   - Command: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <scriptPath>`
+   - Allows safe administration and automation scripts to run without script execution policy blocks.
+
+5. `mkdir`:
+   - Creates recursive directories via Node `fs.mkdirSync(dir, { recursive: true })`.
+
+6. `write_file`:
+   - Writes configurations, source scripts, or markdown documents with UTF-8 encoding.
+
+7. `list_exe_files`:
+   - High-speed drive root indexing with path traversal security checks.
+
+
+================================================================================
+5. AI PROVIDER INTEGRATION & BEST FREE APIS
+================================================================================
+
+Compilator supports 6 AI backends configurable in UI Settings or `.env`:
+
+5.1 BEST FREE APIS COMPARED
+---------------------------
+
++--------------------+-----------------------------+-----------------+---------------------------+
+| Provider           | Best Free Model             | Speed & Limits  | Best For                  |
++--------------------+-----------------------------+-----------------+---------------------------+
+| 1. GROQ (Cloud)    | llama-3.3-70b-versatile     | ~500 tokens/sec | Everyday tasks, planning, |
+|                    | llama-3.1-8b-instant        | 30 RPM / 14,400 | instant intent detection. |
+|                    | mixtral-8x7b-32768          | RPD (Free)      | **(Recommended Default)** |
++--------------------+-----------------------------+-----------------+---------------------------+
+| 2. OLLAMA (Local)  | qwen2.5-coder:7b            | Depends on GPU  | 100% Offline, private,    |
+|                    | llama3.2:3b                 | Unlimited calls | zero data leak, coding.   |
+|                    | deepseek-r1:8b              | Free forever    |                           |
++--------------------+-----------------------------+-----------------+---------------------------+
+| 3. OPENROUTER      | deepseek/deepseek-chat:free | ~50 tokens/sec  | Backup cloud provider     |
+|    (Cloud)         | meta-llama/llama-3.3-70b    | Model dependent | with access to multiple   |
+|                    | google/gemini-2.0-flash-exp | Free tier avail | architectures.            |
++--------------------+-----------------------------+-----------------+---------------------------+
+| 4. LM STUDIO       | Any GGUF model              | Local hardware  | Local GUI LLM management  |
+|    (Local)         | (Mistral, Phi-4, Qwen)      | Unlimited       | with OpenAI-like API.     |
++--------------------+-----------------------------+-----------------+---------------------------+
+| 5. GOOGLE GEMINI   | gemini-2.0-flash            | ~100 tokens/sec | Long context processing   |
+|    (via OpenRouter | gemini-1.5-flash            | 15 RPM Free tier| and complex reasoning.    |
+|     or OpenAI SDK) |                             |                 |                           |
++--------------------+-----------------------------+-----------------+---------------------------+
+
+5.2 SETUP INSTRUCTIONS & ENDPOINTS
+----------------------------------
+
+1. GROQ SETUP (Fastest & Recommended):
+   - Get your free API key at: https://console.groq.com/keys
+   - Add to `.env`:
+     GROQ_API_KEY=gsk_your_actual_key_here
+     AI_PROVIDER=groq
+     AI_MODEL=openai/gpt-oss-120b
+     (or AI_MODEL=llama-3.3-70b-versatile)
+
+2. OLLAMA SETUP (100% Free & Local):
+   - Download & install Ollama: https://ollama.com
+   - Pull your preferred model in PowerShell:
+     `ollama run qwen2.5-coder:7b`
+   - In Compilator Settings, set:
+     Provider: ollama
+     Server URL: http://127.0.0.1:11434
+     Model: qwen2.5-coder:7b
+
+3. LM STUDIO SETUP:
+   - Download LM Studio: https://lmstudio.ai
+   - Start Local Server on port 1234.
+   - In Compilator Settings, set:
+     Provider: lmstudio
+     Server URL: http://127.0.0.1:1234/v1
+
+4. OPENROUTER SETUP:
+   - Get free key at: https://openrouter.ai/keys
+   - In Compilator Settings, set:
+     Provider: openrouter
+     Server URL: https://openrouter.ai/api/v1
+     Model: deepseek/deepseek-chat:free
+
+
+================================================================================
+6. SECURITY & SECRETS ARCHITECTURE
+================================================================================
+
+Compilator enforces strict credential isolation:
+- No Hardcoded Secrets: All secrets are strictly stripped from `package.json`, 
+  scripts, and renderer bundles.
+- Automatic Git Ignoring: `.env`, `.env.local`, and build artifacts are blocked 
+  in `.gitignore`.
+- Dual Environment Loader: Both `run-electron.cjs` and `main.cjs` parse `.env` 
+  at startup without requiring third-party runtime dependencies.
+- Process Environment Scrubbing: `run-electron.cjs` scrubs `ELECTRON_RUN_AS_NODE` 
+  from the environment before spawning Electron, ensuring compatibility with 
+  IDE-hosted terminal sessions.
+
+
+================================================================================
+7. REPOSITORY STRUCTURE & CODEBASE MAP
+================================================================================
+
+compilator/
+├── .env.example               <- Template for local configuration and keys
+├── .gitignore                 <- Blocks .env, build output, and local databases
+├── package.json               <- Scripts and dependencies
+├── run-electron.cjs           <- Safe Electron process launcher (env scrubber)
+├── main.cjs                   <- Electron main process (OS, IPC, Window, Tasks)
+├── preload.cjs                <- contextBridge API definitions
+├── store.cjs                  <- Local JSON disk persistence manager
+├── COMPILATOR_DOCUMENTATION.txt <- This full reference specification
+│
+├── ai/                        <- AI Integration subsystem
+│   ├── config.cjs             <- Provider defaults and env resolver
+│   ├── index.cjs              <- Assistant orchestration & context builder
+│   ├── omniroute-proxy.cjs    <- Optional proxy router
+│   ├── prompt.cjs             <- System prompts and output formatting rules
+│   └── provider.cjs           <- Streaming HTTP client for providers
+│
+├── src/                       <- React 19 Frontend
+│   ├── App.tsx                <- Primary application layout, routes, and state
+│   ├── App.css                <- Dark obsidian styling, animations, layouts
+│   ├── main.tsx               <- React DOM root mount
+│   ├── index.html             <- Application shell
+│   ├── planner-core.js        <- Deterministic tokenizer & catalog matcher (ESM)
+│   ├── planner-core.cjs       <- Deterministic tokenizer & catalog matcher (CJS)
+│   ├── planner-core.d.ts      <- TypeScript definitions for planner-core
+│   │
+│   └── components/
+│       ├── CodeEditor.tsx      <- Monaco code editor with language switching
+│       ├── FloatingTerminal.tsx<- Floating draggable live output window
+│       ├── InteractiveChart.tsx<- Chart.js task analytics visualization
+│       ├── TaskHistory.tsx     <- Filterable and searchable task database view
+│       └── TerminalPanel.tsx   <- Integrated interactive terminal console
+│
+└── tests/
+    └── planner.test.cjs       <- 202 Unit tests verifying intent and planner security
+
+
+================================================================================
+8. RUNNING & BUILDING COMPILATOR
+================================================================================
+
+Requirements:
+- Windows 10 or 11
+- Node.js v20+ (Node.js v24 recommended)
+- Python 3.10+ (for Python script execution tasks)
+- Winget (Windows Package Manager, included by default in Windows 11)
+
+Development Mode:
+  1. Copy `.env.example` to `.env` and insert your API key:
+     `Copy-Item .env.example .env`
+  2. Launch development mode (starts Vite + Electron with HMR):
+     `npm run dev`
+
+Running Unit Tests:
+  `npm test` (Runs 202 test assertions against intent parsing and safety)
+
+Production Build:
+  `npm run build` (TypeScript check via `tsc -b` and Vite bundle compilation)
+
+================================================================================
+                       END OF COMPILATOR SPECIFICATION
+================================================================================
+
